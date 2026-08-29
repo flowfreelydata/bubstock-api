@@ -18,6 +18,18 @@ pool.on("error", (err) => {
   console.error("[db] pool error:", err.message);
 });
 
+// ─── Health ───────────────────────────────────────────────────────────────────
+
+/** Returns true if the database is reachable. Used by /health. */
+export async function pingDB(): Promise<boolean> {
+  try {
+    await pool.query("SELECT 1");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ─── Schema ──────────────────────────────────────────────────────────────────
 
 export async function initSchema(): Promise<void> {

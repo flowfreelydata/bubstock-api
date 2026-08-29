@@ -6,6 +6,12 @@ interface CacheEntry<T> {
 class TTLCache<T> {
   private store = new Map<string, CacheEntry<T>>();
 
+  constructor() {
+    // Proactively evict expired entries every 5 min so the Map doesn't grow
+    // unboundedly on a long-running Railway process.
+    setInterval(() => this.evict(), 5 * 60 * 1000).unref();
+  }
+
   set(key: string, data: T, ttlMs: number): void {
     this.store.set(key, { data, expiresAt: Date.now() + ttlMs });
   }
@@ -30,6 +36,13 @@ class TTLCache<T> {
 
   size(): number {
     return this.store.size;
+  }
+
+  private evict(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.store) {
+      if (now > entry.expiresAt) this.store.delete(key);
+    }
   }
 }
 
