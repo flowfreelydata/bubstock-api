@@ -22,9 +22,11 @@ const ALLERGEN_KEYWORDS: [string, string][] = [
   ["sesame", "sesame"],
 ];
 
+// All FSANZ items are food recalls — the page is already food-specific.
+// We keep the filter to avoid non-food items that may appear in future.
 const RELEVANT_TERMS = [
   "infant", "baby", "formula", "toddler", "child", "children",
-  "food", "allergen", "undeclared", "contamination", "recall",
+  "food", "seafood", "allergen", "undeclared", "contamination", "recall",
 ];
 
 function extractAllergens(text: string): string[] {
@@ -58,12 +60,12 @@ export async function fetchFsanzRecalls(): Promise<RecallEntry[]> {
     const recalls: RecallEntry[] = [];
     let index = 0;
 
-    // Page structure (as of Aug 2026):
-    // .views-row
-    //   .food-recall-desc
-    //     h2 > a        — product title + relative link
-    //     p > p         — reason text
-    //     p.published-date — "Published DD Month YYYY"
+    // Page structure (Aug 2026):
+    // .views-row > .food-recall-desc
+    //   h2 > a                   — title + relative href
+    //   <p><p>reason</p></p>     — HTML5 parsers split this into two sibling <p>s;
+    //                              grab ALL non-date <p> text to be safe
+    //   p.published-date         — "Published DD Month YYYY"
     $(".views-row").each((_i, el) => {
       const $desc = $(el).find(".food-recall-desc");
       if (!$desc.length) return;
@@ -73,8 +75,17 @@ export async function fetchFsanzRecalls(): Promise<RecallEntry[]> {
       const href = titleEl.attr("href") ?? "";
       const recallUrl = href.startsWith("http") ? href : `${FSANZ_BASE}${href}`;
 
-      // Reason lives inside a <p><p>...</p></p> double-nest
-      const reasonRaw = $desc.find("p").first().text().trim();
+      // Collect text from every <p> that isn't the date stamp.
+      // The invalid nested <p> is parsed into two siblings by htmlparser2,
+      // so this catches both the empty outer and the content-bearing inner one.
+      const reasonRaw = $desc
+        .find("p:not(.published-date)")
+        .map((_j, p) => $(p).text().trim())
+        .get()
+        .filter(Boolean)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
 
       const dateRaw = $desc.find(".published-date").first().text()
         .replace(/^Published\s*/i, "").trim();
@@ -88,14 +99,14 @@ export async function fetchFsanzRecalls(): Promise<RecallEntry[]> {
         productName: productName.replace(/\s+/g, " "),
         brand: "",
         recallDate: dateRaw,
-        reason: reasonRaw.replace(/\s+/g, " ").slice(0, 300),
+        reason: reasonRaw.slice(0, 300),
         affectedAllergens: extractAllergens(fullText),
         affectedBarcodes: [],
         recallUrl,
         isActive: true,
       });
 
-      if (recalls.length >= 60) return false; // break
+      if (recalls.length >= 60) return false;
     });
 
     console.log(`[fsanz] fetched ${recalls.length} relevant recall(s)`);
