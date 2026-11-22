@@ -1,19 +1,45 @@
-import type { MelbourneStore, PriceEntry, RetailerFeedStatus } from "../types.js";
+import type {
+  AuCity,
+  AuStateLower,
+  AuStateUpper,
+  MelbourneStore,
+  PriceEntry,
+  RetailerFeedStatus,
+} from "../types.js";
 
 const API_BASE = "https://www.igashop.com.au/api/storefront";
 const WEB_BASE = "https://www.igashop.com.au";
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
-// Verified active IGA Shop store IDs for VIC (Melbourne) and NSW (Sydney)
-const DEFAULT_STORE_ID: Record<"VIC" | "NSW", string> = {
-  VIC: "19071", // Morgan's IGA (VIC)
-  NSW: "32600", // Ashcroft's IGA (NSW)
+// Verified active IGA Shop store IDs across Australia (probed live from /api/storefront/stores)
+// Note: Tasmania IGA stores are not yet onboarded on igashop.com.au (handled transparently below).
+const DEFAULT_STORE_ID: Partial<Record<AuStateUpper, string>> = {
+  VIC: "19071",  // Morgan's IGA (VIC)
+  NSW: "32600",  // Ashcroft's IGA (NSW)
+  QLD: "103318", // IGA Bundamba (QLD)
+  WA: "48077",   // IGA Beechboro (WA)
+  SA: "21024",   // South Plympton IGA (SA)
 };
 
-const CITY_BOUNDS = {
-  melbourne: { stateUpper: "VIC", stateLower: "vic" as const, latMin: -38.30, latMax: -37.50, lonMin: 144.45, lonMax: 145.55 },
-  sydney: { stateUpper: "NSW", stateLower: "nsw" as const, latMin: -34.18, latMax: -33.55, lonMin: 150.60, lonMax: 151.35 },
+const CITY_BOUNDS: Record<
+  AuCity,
+  {
+    stateUpper: AuStateUpper;
+    stateLower: AuStateLower;
+    defaultSuburb: string;
+    latMin: number;
+    latMax: number;
+    lonMin: number;
+    lonMax: number;
+  }
+> = {
+  melbourne: { stateUpper: "VIC", stateLower: "vic", defaultSuburb: "Melbourne", latMin: -38.30, latMax: -37.50, lonMin: 144.45, lonMax: 145.55 },
+  sydney:    { stateUpper: "NSW", stateLower: "nsw", defaultSuburb: "Sydney",    latMin: -34.18, latMax: -33.55, lonMin: 150.60, lonMax: 151.35 },
+  brisbane:  { stateUpper: "QLD", stateLower: "qld", defaultSuburb: "Brisbane",  latMin: -28.05, latMax: -27.05, lonMin: 152.65, lonMax: 153.55 },
+  perth:     { stateUpper: "WA",  stateLower: "wa",  defaultSuburb: "Perth",     latMin: -32.60, latMax: -31.45, lonMin: 115.60, lonMax: 116.25 },
+  adelaide:  { stateUpper: "SA",  stateLower: "sa",  defaultSuburb: "Adelaide",  latMin: -35.30, latMax: -34.55, lonMin: 138.45, lonMax: 138.85 },
+  tasmania:  { stateUpper: "TAS", stateLower: "tas", defaultSuburb: "Hobart",    latMin: -43.65, latMax: -40.65, lonMin: 144.50, lonMax: 148.50 },
 };
 
 interface IgaProduct {
@@ -39,10 +65,22 @@ export interface IgaScraperResult {
 export async function searchIgaPrices(
   productName: string,
   suburb: string,
-  state: "VIC" | "NSW" = "VIC"
+  state: AuStateUpper = "VIC"
 ): Promise<IgaScraperResult> {
   const t0 = Date.now();
-  const storeId = DEFAULT_STORE_ID[state] ?? DEFAULT_STORE_ID.VIC;
+  const storeId = DEFAULT_STORE_ID[state];
+  if (!storeId) {
+    return {
+      entries: [],
+      status: {
+        retailer: "IGA",
+        status: "unavailable",
+        count: 0,
+        latencyMs: 0,
+        note: `IGA Shop online not active in ${state} — check local IGA in-store`,
+      },
+    };
+  }
 
   try {
     const qs = new URLSearchParams({
@@ -177,7 +215,7 @@ async function fetchAllIgaRaw(): Promise<IgaRawStore[]> {
 }
 
 export async function fetchIgaCityStores(
-  city: "melbourne" | "sydney"
+  city: AuCity
 ): Promise<MelbourneStore[]> {
   const b = CITY_BOUNDS[city];
   const raw = await fetchAllIgaRaw();
@@ -213,7 +251,7 @@ export async function fetchIgaCityStores(
       storeNo: s.retailerStoreId,
       name: (s.name ?? s.city ?? "IGA").trim(),
       streetAddress,
-      suburb: (s.city ?? (city === "sydney" ? "Sydney" : "Melbourne")).trim(),
+      suburb: (s.city ?? b.defaultSuburb).trim(),
       state: b.stateLower,
       postcode: (s.postCode ?? "").trim(),
       latitude: Number(lat.toFixed(6)),

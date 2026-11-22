@@ -1,3 +1,7 @@
+export type AuCity = "melbourne" | "sydney" | "brisbane" | "perth" | "adelaide" | "tasmania";
+export type AuStateUpper = "VIC" | "NSW" | "QLD" | "WA" | "SA" | "TAS";
+export type AuStateLower = "vic" | "nsw" | "qld" | "wa" | "sa" | "tas";
+
 export type FeedStatusKind = "live" | "no_match" | "unavailable";
 
 export interface RetailerFeedStatus {
@@ -106,7 +110,7 @@ export interface MelbourneStore {
   name: string;
   streetAddress: string;
   suburb: string;
-  state: "vic" | "nsw";
+  state: AuStateLower;
   postcode: string;
   latitude: number;
   longitude: number;
@@ -162,8 +166,8 @@ export interface PriceGapItem {
 
 export interface MelbournePulse {
   region: string;
-  city?: "melbourne" | "sydney";
-  state?: "VIC" | "NSW";
+  city?: AuCity;
+  state?: AuStateUpper;
   activeRecallsCount: number;
   liveSpecialsCount: number;
   biggestSavingPercent: number | null;

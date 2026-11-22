@@ -46,6 +46,8 @@ import {
   pickBestComparablePair,
 } from "./matcher.js";
 import type {
+  AuCity,
+  AuStateUpper,
   HeadToHeadComparison,
   MelbournePulse,
   MelbourneStore,
@@ -58,43 +60,93 @@ import type {
   StockStateValue,
 } from "./types.js";
 
-type SupportedCity = "melbourne" | "sydney";
+const ALL_CITIES: AuCity[] = ["melbourne", "sydney", "brisbane", "perth", "adelaide", "tasmania"];
+const VALID_AU_STATES = new Set<AuStateUpper>(["VIC", "NSW", "QLD", "WA", "SA", "TAS"]);
 
-function resolveCityAndState(req: Request): {
-  city: SupportedCity;
-  state: "VIC" | "NSW";
+interface CityContext {
+  city: AuCity;
+  state: AuStateUpper;
   regionLabel: string;
   defaultSuburb: string;
   defaultLat: number;
   defaultLon: number;
-} {
-  const rawCity = String(req.query.city ?? "").toLowerCase().trim();
-  const rawState = String(req.query.state ?? "").toUpperCase().trim();
-  const lat = req.query.lat !== undefined ? Number(req.query.lat) : NaN;
+}
 
-  const isSydney =
-    rawCity === "sydney" ||
-    rawState === "NSW" ||
-    (Number.isFinite(lat) && lat > -35.5 && lat < -32.5);
-
-  if (isSydney) {
-    return {
-      city: "sydney",
-      state: "NSW",
-      regionLabel: "Greater Sydney, NSW",
-      defaultSuburb: "Sydney",
-      defaultLat: -33.8688,
-      defaultLon: 151.2093,
-    };
-  }
-  return {
+const CITY_CONTEXTS: Record<AuCity, CityContext> = {
+  melbourne: {
     city: "melbourne",
     state: "VIC",
     regionLabel: "Greater Melbourne, VIC",
     defaultSuburb: "Melbourne",
     defaultLat: -37.8136,
     defaultLon: 144.9631,
-  };
+  },
+  sydney: {
+    city: "sydney",
+    state: "NSW",
+    regionLabel: "Greater Sydney, NSW",
+    defaultSuburb: "Sydney",
+    defaultLat: -33.8688,
+    defaultLon: 151.2093,
+  },
+  brisbane: {
+    city: "brisbane",
+    state: "QLD",
+    regionLabel: "Greater Brisbane, QLD",
+    defaultSuburb: "Brisbane",
+    defaultLat: -27.4698,
+    defaultLon: 153.0251,
+  },
+  perth: {
+    city: "perth",
+    state: "WA",
+    regionLabel: "Greater Perth, WA",
+    defaultSuburb: "Perth",
+    defaultLat: -31.9505,
+    defaultLon: 115.8605,
+  },
+  adelaide: {
+    city: "adelaide",
+    state: "SA",
+    regionLabel: "Greater Adelaide, SA",
+    defaultSuburb: "Adelaide",
+    defaultLat: -34.9285,
+    defaultLon: 138.6007,
+  },
+  tasmania: {
+    city: "tasmania",
+    state: "TAS",
+    regionLabel: "Tasmania (Hobart & Launceston), TAS",
+    defaultSuburb: "Hobart",
+    defaultLat: -42.8821,
+    defaultLon: 147.3272,
+  },
+};
+
+function resolveCityAndState(req: Request): CityContext {
+  const rawCity = String(req.query.city ?? "").toLowerCase().trim();
+  const rawState = String(req.query.state ?? "").toUpperCase().trim();
+  const lat = req.query.lat !== undefined ? Number(req.query.lat) : NaN;
+  const lon = req.query.lon !== undefined ? Number(req.query.lon) : NaN;
+
+  if (rawCity === "sydney" || rawState === "NSW") return CITY_CONTEXTS.sydney;
+  if (rawCity === "brisbane" || rawCity === "bris" || rawState === "QLD") return CITY_CONTEXTS.brisbane;
+  if (rawCity === "perth" || rawState === "WA") return CITY_CONTEXTS.perth;
+  if (rawCity === "adelaide" || rawCity === "adel" || rawState === "SA") return CITY_CONTEXTS.adelaide;
+  if (rawCity === "tasmania" || rawCity === "hobart" || rawCity === "launceston" || rawCity === "tas" || rawState === "TAS") {
+    return CITY_CONTEXTS.tasmania;
+  }
+  if (rawCity === "melbourne" || rawCity === "melb" || rawState === "VIC") return CITY_CONTEXTS.melbourne;
+
+  if (Number.isFinite(lat)) {
+    if (lat < -40.0) return CITY_CONTEXTS.tasmania;
+    if (lat > -29.0) return CITY_CONTEXTS.brisbane;
+    if (Number.isFinite(lon) && lon < 125.0) return CITY_CONTEXTS.perth;
+    if (Number.isFinite(lon) && lon >= 134.0 && lon < 141.0) return CITY_CONTEXTS.adelaide;
+    if (lat > -35.5 && lat < -32.5) return CITY_CONTEXTS.sydney;
+  }
+
+  return CITY_CONTEXTS.melbourne;
 }
 
 const app = express();
@@ -173,12 +225,12 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "2.3.0",
-    cities: ["Greater Melbourne, VIC", "Greater Sydney, NSW"],
+    version: "2.4.0",
+    cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
     endpoints: [
       "/health",
-      "/pulse?city=melbourne|sydney",
+      "/pulse?city=melbourne|sydney|brisbane|perth|adelaide|tasmania",
       "/melbourne/pulse",
       "/prices",
       "/prices/history",
@@ -187,8 +239,8 @@ app.get("/", (_req, res) => {
       "/compare/gaps",
       "/specials",
       "/specials/ingest",
-      "/stores?city=melbourne|sydney",
-      "/recalls?state=VIC|NSW",
+      "/stores?city=melbourne|sydney|brisbane|perth|adelaide|tasmania",
+      "/recalls?state=VIC|NSW|QLD|WA|SA|TAS",
       "/recalls/check",
       "/sightings",
     ],
@@ -200,7 +252,7 @@ app.get("/health", async (_req, res) => {
   const memMB = Math.round(process.memoryUsage().rss / (1024 * 1024));
   res.status(200).json({
     status: dbOk ? "ok" : "degraded",
-    cities: ["Greater Melbourne, VIC", "Greater Sydney, NSW"],
+    cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     db: dbOk ? "connected" : "in-memory-fallback",
     memoryMB: memMB,
     timestamp: new Date().toISOString(),
@@ -218,7 +270,7 @@ app.get("/health", async (_req, res) => {
 async function resolveMultiRetailerPrices(
   cleanProduct: string,
   cleanSuburb: string,
-  state: "VIC" | "NSW"
+  state: AuStateUpper
 ): Promise<ProductPriceResult> {
   // Normalize cache key at state level (Woolworths/Coles chain pricing is state-wide!)
   // so Fitzroy, Carlton & Richmond share 1 cache entry -> massive Railway efficiency!
@@ -537,7 +589,8 @@ app.post("/prices/ingest", async (req: Request, res: Response) => {
   }
 
   const { productName, suburb = "Melbourne", state = "VIC", entries } = req.body ?? {};
-  const cleanState = String(state).toUpperCase() === "NSW" ? "NSW" : "VIC";
+  const upperState = String(state).toUpperCase() as AuStateUpper;
+  const cleanState: AuStateUpper = VALID_AU_STATES.has(upperState) ? upperState : "VIC";
   if (typeof productName !== "string" || productName.trim().length < 2 || !Array.isArray(entries)) {
     res.status(400).json({ error: "productName and entries[] required" });
     return;
@@ -592,8 +645,9 @@ app.post("/prices/ingest", async (req: Request, res: Response) => {
   }
 
   await savePrices(productName.trim(), String(suburb), cleanState, valid);
-  priceCache.delete(`${productName.trim().toLowerCase()}|VIC`);
-  priceCache.delete(`${productName.trim().toLowerCase()}|NSW`);
+  for (const st of VALID_AU_STATES) {
+    priceCache.delete(`${productName.trim().toLowerCase()}|${st}`);
+  }
 
   log("info", "ingested verified prices", {
     product: productName.trim(),
@@ -677,8 +731,8 @@ app.get("/prices/history", async (req: Request, res: Response) => {
     ctx.state,
     Math.min(Number(weeks) || 12, 52)
   );
-  // Fall back to VIC history if NSW archive is just starting (same national chain pricing)
-  if (rows.length === 0 && ctx.state === "NSW") {
+  // Fall back to VIC chain history if newer state archive is still building up (same national chain pricing)
+  if (rows.length === 0 && ctx.state !== "VIC") {
     rows = await getPriceHistory(product.trim(), "Melbourne", "VIC", Math.min(Number(weeks) || 12, 52));
   }
 
@@ -762,7 +816,7 @@ function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number)
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-async function loadCityStores(city: SupportedCity): Promise<MelbourneStore[]> {
+async function loadCityStores(city: AuCity): Promise<MelbourneStore[]> {
   const cached = storesCache.get(city);
   if (cached) return cached;
 
@@ -1038,7 +1092,7 @@ cron.schedule("30 */4 * * *", async () => {
 
 cron.schedule("0 3 * * *", async () => {
   storesCache.clear();
-  await Promise.all([loadCityStores("melbourne"), loadCityStores("sydney")]).catch((e) =>
+  await Promise.all(ALL_CITIES.map((c) => loadCityStores(c))).catch((e) =>
     log("error", "cron stores failed", { err: (e as Error).message })
   );
 });
@@ -1046,7 +1100,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "2.3.0" });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "2.4.0" });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

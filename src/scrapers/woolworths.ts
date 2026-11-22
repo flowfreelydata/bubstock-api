@@ -1,4 +1,7 @@
 import type {
+  AuCity,
+  AuStateLower,
+  AuStateUpper,
   MelbourneStore,
   PriceEntry,
   RetailerFeedStatus,
@@ -123,7 +126,7 @@ export async function searchWoolworthsPrices(
 
           entries.push({
             retailer: "Woolworths",
-            storeName: "Woolworths Online (VIC)",
+            storeName: `Woolworths Online (${state.toUpperCase()})`,
             suburb,
             state: state.toUpperCase(),
             matchedName: (p.DisplayName ?? p.Name ?? productName).trim(),
@@ -322,10 +325,12 @@ function parseWowHours(raw?: WowRawStore["TradingHours"]): TradingHoursEntry[] {
 }
 
 const CITY_STORE_GRIDS: Record<
-  "melbourne" | "sydney",
+  AuCity,
   {
-    stateUpper: "VIC" | "NSW";
-    stateLower: "vic" | "nsw";
+    stateUpper: AuStateUpper;
+    stateLower: AuStateLower;
+    defaultSuburb: string;
+    defaultPostcode: string;
     bounds: { latMin: number; latMax: number; lonMin: number; lonMax: number };
     grid: Array<[number, number]>;
   }
@@ -333,6 +338,8 @@ const CITY_STORE_GRIDS: Record<
   melbourne: {
     stateUpper: "VIC",
     stateLower: "vic",
+    defaultSuburb: "Melbourne",
+    defaultPostcode: "3000",
     bounds: { latMin: -38.30, latMax: -37.50, lonMin: 144.45, lonMax: 145.55 },
     grid: [
       [-37.8136, 144.9631],
@@ -346,6 +353,8 @@ const CITY_STORE_GRIDS: Record<
   sydney: {
     stateUpper: "NSW",
     stateLower: "nsw",
+    defaultSuburb: "Sydney",
+    defaultPostcode: "2000",
     bounds: { latMin: -34.18, latMax: -33.55, lonMin: 150.60, lonMax: 151.35 },
     grid: [
       [-33.8688, 151.2093],
@@ -361,10 +370,68 @@ const CITY_STORE_GRIDS: Record<
       [-34.0310, 151.0580],
     ],
   },
+  brisbane: {
+    stateUpper: "QLD",
+    stateLower: "qld",
+    defaultSuburb: "Brisbane",
+    defaultPostcode: "4000",
+    bounds: { latMin: -28.05, latMax: -27.05, lonMin: 152.65, lonMax: 153.55 },
+    grid: [
+      [-27.4698, 153.0251], // Brisbane CBD
+      [-27.3200, 153.0200], // North (Chermside / North Lakes)
+      [-27.5800, 153.0800], // South (Sunnybank / Mt Gravatt)
+      [-27.6200, 152.7600], // Ipswich / West
+      [-27.5300, 153.2500], // Redlands / Bayside
+      [-27.7200, 153.1500], // Logan
+    ],
+  },
+  perth: {
+    stateUpper: "WA",
+    stateLower: "wa",
+    defaultSuburb: "Perth",
+    defaultPostcode: "6000",
+    bounds: { latMin: -32.60, latMax: -31.45, lonMin: 115.60, lonMax: 116.25 },
+    grid: [
+      [-31.9505, 115.8605], // Perth CBD
+      [-31.7450, 115.7700], // Joondalup / North
+      [-31.8900, 116.0100], // Midland / East
+      [-32.0569, 115.7439], // Fremantle / Cockburn
+      [-32.1500, 115.9500], // Armadale / Canning
+      [-32.3500, 115.7500], // Rockingham / Mandurah
+    ],
+  },
+  adelaide: {
+    stateUpper: "SA",
+    stateLower: "sa",
+    defaultSuburb: "Adelaide",
+    defaultPostcode: "5000",
+    bounds: { latMin: -35.30, latMax: -34.55, lonMin: 138.45, lonMax: 138.85 },
+    grid: [
+      [-34.9285, 138.6007], // Adelaide CBD
+      [-34.7600, 138.6400], // Salisbury / Elizabeth
+      [-34.8600, 138.5200], // Port Adelaide / West
+      [-35.0200, 138.5500], // Marion / Glenelg
+      [-35.1400, 138.5000], // Noarlunga / South
+      [-35.0100, 138.7300], // Adelaide Hills / Mt Barker
+    ],
+  },
+  tasmania: {
+    stateUpper: "TAS",
+    stateLower: "tas",
+    defaultSuburb: "Hobart",
+    defaultPostcode: "7000",
+    bounds: { latMin: -43.65, latMax: -40.65, lonMin: 144.50, lonMax: 148.50 },
+    grid: [
+      [-42.8821, 147.3272], // Hobart / Glenorchy / Kingston
+      [-41.4332, 147.1441], // Launceston
+      [-41.1789, 146.3594], // Devonport / Ulverstone
+      [-41.0522, 145.9061], // Burnie / Wynyard
+    ],
+  },
 };
 
 export async function fetchWoolworthsCityStores(
-  city: "melbourne" | "sydney"
+  city: AuCity
 ): Promise<MelbourneStore[]> {
   const cfg = CITY_STORE_GRIDS[city];
   const cookie = await getSession();
@@ -416,9 +483,9 @@ export async function fetchWoolworthsCityStores(
           storeNo: s.StoreNo,
           name: (s.Name ?? s.Suburb ?? "Woolworths").trim(),
           streetAddress: addressParts.join(", ").trim(),
-          suburb: (s.Suburb ?? (city === "sydney" ? "Sydney" : "Melbourne")).trim(),
+          suburb: (s.Suburb ?? cfg.defaultSuburb).trim(),
           state: cfg.stateLower,
-          postcode: (s.Postcode ?? (city === "sydney" ? "2000" : "3000")).trim(),
+          postcode: (s.Postcode ?? cfg.defaultPostcode).trim(),
           latitude: slat,
           longitude: slon,
           phone: s.Phone?.trim() || undefined,
