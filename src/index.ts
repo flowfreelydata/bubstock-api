@@ -30,6 +30,7 @@ import {
   type RecallRow,
 } from "./db.js";
 import {
+  areComparablePair,
   classifyPairMatch,
   computeUnitMetric,
   matchScore,
@@ -268,7 +269,11 @@ app.get("/compare", priceLimit, async (req: Request, res: Response) => {
   const colesPool = result.entries.filter((e) => e.retailer === "Coles");
 
   const bestWow = pickBestMatch(cleanProduct, wowPool);
-  const bestColes = pickBestMatch(cleanProduct, colesPool);
+  let bestColes = pickBestMatch(cleanProduct, colesPool);
+  if (bestWow && bestColes && !areComparablePair(bestWow, bestColes)) {
+    // Reject non-comparable pair (e.g. bulk carton vs normal pack or different sub-line)
+    bestColes = null;
+  }
 
   const wowMetric = bestWow ? computeUnitMetric(bestWow) : null;
   const colesMetric = bestColes ? computeUnitMetric(bestColes) : null;
