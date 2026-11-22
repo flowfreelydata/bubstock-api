@@ -113,7 +113,7 @@ export interface MelbourneStore {
   phone?: string;
   hours: TradingHoursEntry[];
   hasDedicatedBabyAisle: boolean;
-  source: "woolworths_api" | "aldi_api";
+  source: "woolworths_api" | "aldi_api" | "iga_api" | "priceline_api";
 }
 
 export interface HeadToHeadComparison {

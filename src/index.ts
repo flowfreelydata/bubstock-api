@@ -12,6 +12,8 @@ import {
 } from "./scrapers/woolworths.js";
 import { searchColesPrices, fetchColesBabySpecials } from "./scrapers/coles.js";
 import { searchAldiPrices, fetchAldiMelbourneStores } from "./scrapers/aldi.js";
+import { searchIgaPrices, fetchIgaCityStores } from "./scrapers/iga.js";
+import { searchPricelinePrices, fetchPricelineCityStores } from "./scrapers/priceline.js";
 import { fetchAllOfficialRecalls } from "./scrapers/fsanz.js";
 import {
   priceCache,
@@ -171,7 +173,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "2.2.0",
+    version: "2.3.0",
     cities: ["Greater Melbourne, VIC", "Greater Sydney, NSW"],
     policy: "100% live & verified data — zero synthetic fallbacks",
     endpoints: [
@@ -230,12 +232,14 @@ async function resolveMultiRetailerPrices(
     const again = priceCache.get(cacheKey);
     if (again) return { ...again, suburb: cleanSuburb };
 
-    // Sydney launch focuses on Woolworths & Coles only; Melbourne includes ALDI as well
+    // Query all 5 open live Australian retail APIs in parallel (Woolworths, Coles, IGA, Priceline, ALDI)
     const includeAldi = state === "VIC";
 
-    const [wowRes, colesLiveRes, aldiRes] = await Promise.all([
+    const [wowRes, colesLiveRes, igaRes, pricelineRes, aldiRes] = await Promise.all([
       searchWoolworthsPrices(cleanProduct, cleanSuburb, state),
       searchColesPrices(cleanProduct, cleanSuburb, state),
+      searchIgaPrices(cleanProduct, cleanSuburb, state),
+      searchPricelinePrices(cleanProduct, cleanSuburb, state),
       includeAldi
         ? searchAldiPrices(cleanProduct, cleanSuburb, state)
         : Promise.resolve(null),
@@ -284,9 +288,53 @@ async function resolveMultiRetailerPrices(
       }
     }
 
+    let igaEntries = igaRes.entries;
+    let igaStatus: RetailerFeedStatus = igaRes.status;
+    if (igaEntries.length === 0) {
+      const dbIga = await getFreshRetailerPrices(cleanProduct, "IGA", 48);
+      if (dbIga.length > 0) {
+        igaEntries = dbIga.map((e) => ({
+          ...e,
+          storeName: `IGA Online (${state})`,
+          suburb: cleanSuburb,
+          state,
+        }));
+        igaStatus = {
+          retailer: "IGA",
+          status: "live",
+          count: dbIga.length,
+          latencyMs: igaRes.status.latencyMs,
+          note: `Verified IGA ${state} price (Postgres sync)`,
+        };
+      }
+    }
+
+    let pricelineEntries = pricelineRes.entries;
+    let pricelineStatus: RetailerFeedStatus = pricelineRes.status;
+    if (pricelineEntries.length === 0) {
+      const dbPriceline = await getFreshRetailerPrices(cleanProduct, "Priceline", 48);
+      if (dbPriceline.length > 0) {
+        pricelineEntries = dbPriceline.map((e) => ({
+          ...e,
+          storeName: `Priceline Pharmacy (${state})`,
+          suburb: cleanSuburb,
+          state,
+        }));
+        pricelineStatus = {
+          retailer: "Priceline",
+          status: "live",
+          count: dbPriceline.length,
+          latencyMs: pricelineRes.status.latencyMs,
+          note: `Verified Priceline ${state} price (Postgres sync)`,
+        };
+      }
+    }
+
     const allRaw = [
       ...wowEntries,
       ...colesEntries,
+      ...igaEntries,
+      ...pricelineEntries,
       ...(aldiRes ? aldiRes.entries : []),
     ];
     const scored = allRaw
@@ -305,7 +353,23 @@ async function resolveMultiRetailerPrices(
     const retailerStatus: RetailerFeedStatus[] = [
       wowStatus,
       colesStatus,
+      igaStatus,
+      pricelineStatus,
       ...(aldiRes ? [aldiRes.status] : []),
+      {
+        retailer: "Chemist Warehouse",
+        status: "unavailable",
+        count: 0,
+        latencyMs: 0,
+        note: "In-store / call store (no open public API)",
+      },
+      {
+        retailer: "Baby Bunting",
+        status: "unavailable",
+        count: 0,
+        latencyMs: 0,
+        note: "In-store / call store (no open public API)",
+      },
     ];
 
     const result: ProductPriceResult = {
@@ -317,12 +381,13 @@ async function resolveMultiRetailerPrices(
       fetchedAt: new Date().toISOString(),
     };
 
-    // 30-minute state-level TTL keeps upstream scrapes minimal and Railway bills tiny
     priceCache.set(cacheKey, result, 30 * 60 * 1000);
 
     const freshToPersist = [
       ...wowRes.entries,
       ...colesLiveRes.entries,
+      ...igaRes.entries,
+      ...pricelineRes.entries,
       ...(aldiRes ? aldiRes.entries : []),
     ];
     savePrices(cleanProduct, cleanSuburb, state, freshToPersist).catch((e) =>
@@ -462,7 +527,7 @@ app.get("/compare/gaps", async (req: Request, res: Response) => {
 
 // ─── Verified Price & Specials Ingest ────────────────────────────────────────
 
-const ALLOWED_INGEST_RETAILERS = new Set(["Coles", "Woolworths", "ALDI"]);
+const ALLOWED_INGEST_RETAILERS = new Set(["Coles", "Woolworths", "IGA", "Priceline", "ALDI"]);
 
 app.post("/prices/ingest", async (req: Request, res: Response) => {
   const ingestKey = process.env.INGEST_API_KEY;
@@ -491,7 +556,7 @@ app.post("/prices/ingest", async (req: Request, res: Response) => {
     if (
       raw.productUrl &&
       typeof raw.productUrl === "string" &&
-      !/^https:\/\/www\.(coles|woolworths|aldi)\.com\.au\//i.test(raw.productUrl)
+      !/^https:\/\/www\.(coles|woolworths|aldi|priceline)\.com\.au\/|^https:\/\/www\.igashop\.com\.au\//i.test(raw.productUrl)
     ) {
       continue;
     }
@@ -705,14 +770,20 @@ async function loadCityStores(city: SupportedCity): Promise<MelbourneStore[]> {
     const again = storesCache.get(city);
     if (again) return again;
 
-    const wow = await fetchWoolworthsCityStores(city);
-    const aldi = city === "melbourne" ? await fetchAldiMelbourneStores() : [];
-    const combined = [...wow, ...aldi];
+    const [wow, iga, priceline, aldi] = await Promise.all([
+      fetchWoolworthsCityStores(city),
+      fetchIgaCityStores(city),
+      fetchPricelineCityStores(city),
+      city === "melbourne" ? fetchAldiMelbourneStores() : Promise.resolve([]),
+    ]);
+    const combined = [...wow, ...iga, ...priceline, ...aldi];
     if (combined.length > 0) {
       storesCache.set(city, combined, 12 * 60 * 60 * 1000);
     }
     log("info", `loaded real ${city} stores`, {
       woolworths: wow.length,
+      iga: iga.length,
+      priceline: priceline.length,
       aldi: aldi.length,
       total: combined.length,
     });
@@ -918,17 +989,15 @@ async function handlePulse(req: Request, res: Response) {
     biggestSavingPercent: specials.length > 0 ? specials[0].savingsPercent : null,
     sightingsLast24h: sightings24h,
     storesTracked: stores.length,
-    retailers:
-      ctx.city === "sydney"
-        ? [
-            { name: "Woolworths", mode: "live_api" },
-            { name: "Coles", mode: "live_api" },
-          ]
-        : [
-            { name: "Woolworths", mode: "live_api" },
-            { name: "Coles", mode: "live_api" },
-            { name: "ALDI", mode: "live_api" },
-          ],
+    retailers: [
+      { name: "Woolworths", mode: "live_api" },
+      { name: "Coles", mode: "live_api" },
+      { name: "IGA", mode: "live_api" },
+      { name: "Priceline Pharmacy", mode: "live_api" },
+      ...(ctx.city === "melbourne" ? [{ name: "ALDI", mode: "live_api" as const }] : []),
+      { name: "Chemist Warehouse", mode: "in_store_only" },
+      { name: "Baby Bunting", mode: "in_store_only" },
+    ],
     updatedAt: new Date().toISOString(),
   };
 
@@ -977,7 +1046,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "2.2.0" });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "2.3.0" });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })
