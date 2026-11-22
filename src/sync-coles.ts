@@ -10,6 +10,7 @@
 import "dotenv/config";
 import { searchColesPrices, fetchColesBabySpecials } from "./scrapers/coles.js";
 import { searchWoolworthsPrices } from "./scrapers/woolworths.js";
+import { searchPricelinePrices } from "./scrapers/priceline.js";
 import { pickBestMatch } from "./matcher.js";
 
 const API_BASE = process.env.BUBSTOCK_API_URL ?? "https://bubstock-api-production.up.railway.app";
@@ -99,18 +100,26 @@ async function run() {
   let wowOnly = 0;
 
   for (const product of MELBOURNE_KEY_PRODUCTS) {
-    const [colesRes, wowRes] = await Promise.all([
+    const [colesRes, wowRes, pricelineRes] = await Promise.all([
       searchColesPrices(product, "Melbourne", "VIC"),
       searchWoolworthsPrices(product, "Melbourne", "VIC"),
+      searchPricelinePrices(product, "Melbourne", "VIC"),
     ]);
 
     const bestColes = pickBestMatch(product, colesRes.entries);
     const bestWow = pickBestMatch(product, wowRes.entries);
+    const bestPriceline = pickBestMatch(product, pricelineRes.entries);
 
-    const toIngest = [...colesRes.entries.slice(0, 5), ...wowRes.entries.slice(0, 5)];
+    const toIngest = [
+      ...colesRes.entries.slice(0, 5),
+      ...wowRes.entries.slice(0, 5),
+      ...pricelineRes.entries.slice(0, 5),
+    ];
     if (toIngest.length > 0) {
       await ingestPrices(product, toIngest);
     }
+
+    const plNote = bestPriceline ? ` | Priceline $${bestPriceline.price.toFixed(2)}` : "";
 
     if (bestColes && bestWow) {
       matchedBoth++;
@@ -122,14 +131,16 @@ async function run() {
             ? `COLES -$${Math.abs(Number(diff)).toFixed(2)}`
             : `WOOLWORTHS -$${Math.abs(Number(diff)).toFixed(2)}`;
       console.log(
-        `  ✅ ${product}: Coles $${bestColes.price.toFixed(2)} vs Woolworths $${bestWow.price.toFixed(2)} → ${winner}`
+        `  ✅ ${product}: Coles $${bestColes.price.toFixed(2)} vs Woolworths $${bestWow.price.toFixed(2)} → ${winner}${plNote}`
       );
     } else if (bestColes) {
       colesOnly++;
-      console.log(`  🟡 ${product}: Coles $${bestColes.price.toFixed(2)} (no Woolworths exact match)`);
+      console.log(`  🟡 ${product}: Coles $${bestColes.price.toFixed(2)} (no Woolworths exact match)${plNote}`);
     } else if (bestWow) {
       wowOnly++;
-      console.log(`  🟢 ${product}: Woolworths $${bestWow.price.toFixed(2)} (no Coles exact match)`);
+      console.log(`  🟢 ${product}: Woolworths $${bestWow.price.toFixed(2)} (no Coles exact match)${plNote}`);
+    } else if (bestPriceline) {
+      console.log(`  💗 ${product}: Priceline $${bestPriceline.price.toFixed(2)}`);
     }
 
     // Polite 600ms pacing between queries
