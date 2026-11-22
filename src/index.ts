@@ -4,15 +4,22 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import cron from "node-cron";
+import zlib from "node:zlib";
 import {
   searchWoolworthsPrices,
   fetchWoolworthsBabySpecials,
-  fetchWoolworthsMelbourneStores,
+  fetchWoolworthsCityStores,
 } from "./scrapers/woolworths.js";
 import { searchColesPrices, fetchColesBabySpecials } from "./scrapers/coles.js";
 import { searchAldiPrices, fetchAldiMelbourneStores } from "./scrapers/aldi.js";
 import { fetchAllOfficialRecalls } from "./scrapers/fsanz.js";
-import { priceCache, recallCache, specialsCache, storesCache } from "./cache.js";
+import {
+  priceCache,
+  recallCache,
+  singleflight,
+  specialsCache,
+  storesCache,
+} from "./cache.js";
 import {
   initSchema,
   savePrices,
@@ -49,8 +56,47 @@ import type {
   StockStateValue,
 } from "./types.js";
 
+type SupportedCity = "melbourne" | "sydney";
+
+function resolveCityAndState(req: Request): {
+  city: SupportedCity;
+  state: "VIC" | "NSW";
+  regionLabel: string;
+  defaultSuburb: string;
+  defaultLat: number;
+  defaultLon: number;
+} {
+  const rawCity = String(req.query.city ?? "").toLowerCase().trim();
+  const rawState = String(req.query.state ?? "").toUpperCase().trim();
+  const lat = req.query.lat !== undefined ? Number(req.query.lat) : NaN;
+
+  const isSydney =
+    rawCity === "sydney" ||
+    rawState === "NSW" ||
+    (Number.isFinite(lat) && lat > -35.5 && lat < -32.5);
+
+  if (isSydney) {
+    return {
+      city: "sydney",
+      state: "NSW",
+      regionLabel: "Greater Sydney, NSW",
+      defaultSuburb: "Sydney",
+      defaultLat: -33.8688,
+      defaultLon: 151.2093,
+    };
+  }
+  return {
+    city: "melbourne",
+    state: "VIC",
+    regionLabel: "Greater Melbourne, VIC",
+    defaultSuburb: "Melbourne",
+    defaultLat: -37.8136,
+    defaultLon: 144.9631,
+  };
+}
+
 const app = express();
-app.set("trust proxy", 1); // Required behind Railway's reverse proxy for accurate rate limiting
+app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT ?? 3000);
 
 function log(level: "info" | "warn" | "error", msg: string, extra?: object) {
@@ -59,11 +105,33 @@ function log(level: "info" | "warn" | "error", msg: string, extra?: object) {
   );
 }
 
-// ─── Security & global middleware ─────────────────────────────────────────────
+// ─── Security, gzip compression & middleware ──────────────────────────────────
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "256kb" }));
+
+// Zero-dependency gzip compression for JSON payloads > 1 KB (cuts Railway egress ~80%)
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const acceptEncoding = String(req.headers["accept-encoding"] ?? "");
+  if (!acceptEncoding.includes("gzip")) {
+    next();
+    return;
+  }
+  const origJson = res.json.bind(res);
+  res.json = ((body: unknown) => {
+    const raw = JSON.stringify(body);
+    if (raw.length < 1024) {
+      return origJson(body);
+    }
+    const compressed = zlib.gzipSync(raw, { level: 6 });
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Encoding", "gzip");
+    res.setHeader("Vary", "Accept-Encoding");
+    return res.send(compressed);
+  }) as Response["json"];
+  next();
+});
 
 app.use((req: Request, _res: Response, next: NextFunction) => {
   (req as any).id = Math.random().toString(36).slice(2, 10);
@@ -74,7 +142,7 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
 
 const generalLimit = rateLimit({
   windowMs: 60_000,
-  max: 160,
+  max: 180,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests — please slow down" },
@@ -82,7 +150,7 @@ const generalLimit = rateLimit({
 
 const priceLimit = rateLimit({
   windowMs: 60_000,
-  max: 30,
+  max: 35,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Price lookup rate limit exceeded — wait a minute" },
@@ -102,12 +170,13 @@ app.use(generalLimit);
 
 app.get("/", (_req, res) => {
   res.json({
-    service: "bubstock-melbourne-api",
-    version: "2.1.0",
-    region: "Greater Melbourne, VIC",
+    service: "bubstock-au-api",
+    version: "2.2.0",
+    cities: ["Greater Melbourne, VIC", "Greater Sydney, NSW"],
     policy: "100% live & verified data — zero synthetic fallbacks",
     endpoints: [
       "/health",
+      "/pulse?city=melbourne|sydney",
       "/melbourne/pulse",
       "/prices",
       "/prices/history",
@@ -116,8 +185,8 @@ app.get("/", (_req, res) => {
       "/compare/gaps",
       "/specials",
       "/specials/ingest",
-      "/stores",
-      "/recalls",
+      "/stores?city=melbourne|sydney",
+      "/recalls?state=VIC|NSW",
       "/recalls/check",
       "/sightings",
     ],
@@ -126,10 +195,12 @@ app.get("/", (_req, res) => {
 
 app.get("/health", async (_req, res) => {
   const dbOk = await pingDB();
+  const memMB = Math.round(process.memoryUsage().rss / (1024 * 1024));
   res.status(200).json({
     status: dbOk ? "ok" : "degraded",
-    region: "Greater Melbourne, VIC",
+    cities: ["Greater Melbourne, VIC", "Greater Sydney, NSW"],
     db: dbOk ? "connected" : "in-memory-fallback",
+    memoryMB: memMB,
     timestamp: new Date().toISOString(),
     cache: {
       price: priceCache.size(),
@@ -140,146 +211,166 @@ app.get("/health", async (_req, res) => {
   });
 });
 
-// ─── Shared live + Postgres-verified price resolver ──────────────────────────
+// ─── Coalesced live + Postgres-verified price resolver ───────────────────────
 
 async function resolveMultiRetailerPrices(
   cleanProduct: string,
-  cleanSuburb: string
+  cleanSuburb: string,
+  state: "VIC" | "NSW"
 ): Promise<ProductPriceResult> {
-  const state = "VIC";
-  const key = `${cleanProduct.toLowerCase()}|${cleanSuburb.toLowerCase()}|${state}`;
-  const cached = priceCache.get(key);
-  if (cached) return cached;
-
-  const [wowRes, colesLiveRes, aldiRes] = await Promise.all([
-    searchWoolworthsPrices(cleanProduct, cleanSuburb, state),
-    searchColesPrices(cleanProduct, cleanSuburb, state),
-    searchAldiPrices(cleanProduct, cleanSuburb, state),
-  ]);
-
-  let wowEntries = wowRes.entries;
-  let wowStatus: RetailerFeedStatus = wowRes.status;
-  if (wowEntries.length === 0) {
-    const dbWow = await getFreshRetailerPrices(cleanProduct, "Woolworths", 48);
-    if (dbWow.length > 0) {
-      wowEntries = dbWow;
-      wowStatus = {
-        retailer: "Woolworths",
-        status: "live",
-        count: dbWow.length,
-        latencyMs: wowRes.status.latencyMs,
-        note: "Verified Woolworths VIC price (Postgres sync)",
-      };
-    }
+  // Normalize cache key at state level (Woolworths/Coles chain pricing is state-wide!)
+  // so Fitzroy, Carlton & Richmond share 1 cache entry -> massive Railway efficiency!
+  const cacheKey = `${cleanProduct.toLowerCase()}|${state}`;
+  const cached = priceCache.get(cacheKey);
+  if (cached) {
+    return { ...cached, suburb: cleanSuburb };
   }
 
-  let colesEntries = colesLiveRes.entries;
-  let colesStatus: RetailerFeedStatus = colesLiveRes.status;
+  return singleflight(`price:${cacheKey}`, async () => {
+    const again = priceCache.get(cacheKey);
+    if (again) return { ...again, suburb: cleanSuburb };
 
-  // If Railway's datacenter IP is geo-blocked by Coles, check Postgres for fresh
-  // verified Coles VIC prices synced from Melbourne (on-device iPhone or sync worker).
-  if (colesEntries.length === 0) {
-    const dbColes = await getFreshRetailerPrices(cleanProduct, "Coles", 48);
-    if (dbColes.length > 0) {
-      colesEntries = dbColes;
-      const newestMs = Math.max(...dbColes.map((e) => new Date(e.lastUpdated).getTime()));
-      const ageHrs = Math.max(0, Math.round((Date.now() - newestMs) / 3_600_000));
-      colesStatus = {
-        retailer: "Coles",
-        status: "live",
-        count: dbColes.length,
-        latencyMs: colesLiveRes.status.latencyMs,
-        note:
-          ageHrs < 1
-            ? "Verified Coles VIC price (synced just now)"
-            : `Verified Coles VIC price (synced ${ageHrs}h ago)`,
-      };
+    // Sydney launch focuses on Woolworths & Coles only; Melbourne includes ALDI as well
+    const includeAldi = state === "VIC";
+
+    const [wowRes, colesLiveRes, aldiRes] = await Promise.all([
+      searchWoolworthsPrices(cleanProduct, cleanSuburb, state),
+      searchColesPrices(cleanProduct, cleanSuburb, state),
+      includeAldi
+        ? searchAldiPrices(cleanProduct, cleanSuburb, state)
+        : Promise.resolve(null),
+    ]);
+
+    let wowEntries = wowRes.entries;
+    let wowStatus: RetailerFeedStatus = wowRes.status;
+    if (wowEntries.length === 0) {
+      const dbWow = await getFreshRetailerPrices(cleanProduct, "Woolworths", 48);
+      if (dbWow.length > 0) {
+        wowEntries = dbWow.map((e) => ({ ...e, suburb: cleanSuburb, state }));
+        wowStatus = {
+          retailer: "Woolworths",
+          status: "live",
+          count: dbWow.length,
+          latencyMs: wowRes.status.latencyMs,
+          note: `Verified Woolworths ${state} price (Postgres sync)`,
+        };
+      }
     }
-  }
 
-  // Filter out egregious mismatches (e.g. $4 sachets when looking up a 900g tin) while keeping valid hits
-  const allRaw = [...wowEntries, ...colesEntries, ...aldiRes.entries];
-  const scored = allRaw
-    .map((entry) => ({ entry, score: matchScore(cleanProduct, entry) }))
-    .filter((item) => item.score >= 0)
-    .sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return a.entry.price - b.entry.price;
-    });
+    let colesEntries = colesLiveRes.entries;
+    let colesStatus: RetailerFeedStatus = colesLiveRes.status;
 
-  // If canonical matcher filtered everything (e.g. very generic query like "nappies"), keep raw sorted by price
-  const entries =
-    scored.length > 0
-      ? scored.map((s) => s.entry)
-      : allRaw.sort((a, b) => a.price - b.price);
+    if (colesEntries.length === 0) {
+      const dbColes = await getFreshRetailerPrices(cleanProduct, "Coles", 48);
+      if (dbColes.length > 0) {
+        colesEntries = dbColes.map((e) => ({
+          ...e,
+          storeName: `Coles Online (${state})`,
+          suburb: cleanSuburb,
+          state,
+        }));
+        const newestMs = Math.max(...dbColes.map((e) => new Date(e.lastUpdated).getTime()));
+        const ageHrs = Math.max(0, Math.round((Date.now() - newestMs) / 3_600_000));
+        colesStatus = {
+          retailer: "Coles",
+          status: "live",
+          count: dbColes.length,
+          latencyMs: colesLiveRes.status.latencyMs,
+          note:
+            ageHrs < 1
+              ? `Verified Coles ${state} price (synced just now)`
+              : `Verified Coles ${state} price (synced ${ageHrs}h ago)`,
+        };
+      }
+    }
 
-  const retailerStatus: RetailerFeedStatus[] = [
-    wowStatus,
-    colesStatus,
-    aldiRes.status,
-    {
-      retailer: "Chemist Warehouse",
-      status: "unavailable",
-      count: 0,
-      latencyMs: 0,
-      note: "No public live API — check in-store or call store",
-    },
-  ];
+    const allRaw = [
+      ...wowEntries,
+      ...colesEntries,
+      ...(aldiRes ? aldiRes.entries : []),
+    ];
+    const scored = allRaw
+      .map((entry) => ({ entry, score: matchScore(cleanProduct, entry) }))
+      .filter((item) => item.score >= 0)
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        return a.entry.price - b.entry.price;
+      });
 
-  const result: ProductPriceResult = {
-    productName: cleanProduct,
-    suburb: cleanSuburb,
-    state,
-    entries,
-    retailerStatus,
-    fetchedAt: new Date().toISOString(),
-  };
+    const entries =
+      scored.length > 0
+        ? scored.map((s) => s.entry)
+        : allRaw.sort((a, b) => a.price - b.price);
 
-  priceCache.set(key, result, 15 * 60 * 1000);
+    const retailerStatus: RetailerFeedStatus[] = [
+      wowStatus,
+      colesStatus,
+      ...(aldiRes ? [aldiRes.status] : []),
+    ];
 
-  // Persist freshly scraped live entries (avoid re-inserting DB-sourced Coles entries)
-  const freshToPersist = [
-    ...wowRes.entries,
-    ...colesLiveRes.entries,
-    ...aldiRes.entries,
-  ];
-  savePrices(cleanProduct, cleanSuburb, state, freshToPersist).catch((e) =>
-    log("error", "savePrices failed", { err: (e as Error).message })
-  );
+    const result: ProductPriceResult = {
+      productName: cleanProduct,
+      suburb: cleanSuburb,
+      state,
+      entries,
+      retailerStatus,
+      fetchedAt: new Date().toISOString(),
+    };
 
-  return result;
+    // 30-minute state-level TTL keeps upstream scrapes minimal and Railway bills tiny
+    priceCache.set(cacheKey, result, 30 * 60 * 1000);
+
+    const freshToPersist = [
+      ...wowRes.entries,
+      ...colesLiveRes.entries,
+      ...(aldiRes ? aldiRes.entries : []),
+    ];
+    savePrices(cleanProduct, cleanSuburb, state, freshToPersist).catch((e) =>
+      log("error", "savePrices failed", { err: (e as Error).message })
+    );
+
+    return result;
+  });
 }
 
 // ─── Live Multi-Retailer Prices ──────────────────────────────────────────────
 
 app.get("/prices", priceLimit, async (req: Request, res: Response) => {
-  const { product, suburb = "Melbourne" } = req.query;
+  const { product } = req.query;
   if (!product || typeof product !== "string" || product.trim().length < 2) {
     res.status(400).json({ error: "product query param required (min 2 chars)" });
     return;
   }
 
+  const ctx = resolveCityAndState(req);
   const cleanProduct = product.trim();
-  const cleanSuburb = String(suburb).trim() || "Melbourne";
-  log("info", "live price lookup", { product: cleanProduct, suburb: cleanSuburb, id: (req as any).id });
+  const cleanSuburb = String(req.query.suburb ?? ctx.defaultSuburb).trim() || ctx.defaultSuburb;
 
-  const result = await resolveMultiRetailerPrices(cleanProduct, cleanSuburb);
-  res.setHeader("Cache-Control", "public, max-age=180");
+  log("info", "live price lookup", {
+    product: cleanProduct,
+    suburb: cleanSuburb,
+    state: ctx.state,
+    id: (req as any).id,
+  });
+
+  const result = await resolveMultiRetailerPrices(cleanProduct, cleanSuburb, ctx.state);
+  res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=900");
   res.json(result);
 });
 
 // ─── Exact Canonical Coles vs Woolworths Head-to-Head Compare ────────────────
 
 app.get("/compare", priceLimit, async (req: Request, res: Response) => {
-  const { product, suburb = "Melbourne" } = req.query;
+  const { product } = req.query;
   if (!product || typeof product !== "string" || product.trim().length < 2) {
     res.status(400).json({ error: "product query param required (min 2 chars)" });
     return;
   }
 
+  const ctx = resolveCityAndState(req);
   const cleanProduct = product.trim();
-  const cleanSuburb = String(suburb).trim() || "Melbourne";
-  const result = await resolveMultiRetailerPrices(cleanProduct, cleanSuburb);
+  const cleanSuburb = String(req.query.suburb ?? ctx.defaultSuburb).trim() || ctx.defaultSuburb;
+  const result = await resolveMultiRetailerPrices(cleanProduct, cleanSuburb, ctx.state);
 
   const wowPool = result.entries.filter((e) => e.retailer === "Woolworths");
   const colesPool = result.entries.filter((e) => e.retailer === "Coles");
@@ -336,7 +427,7 @@ app.get("/compare", priceLimit, async (req: Request, res: Response) => {
   const comparison: HeadToHeadComparison = {
     query: cleanProduct,
     suburb: cleanSuburb,
-    state: "VIC",
+    state: ctx.state,
     matchQuality,
     woolworths: bestWow ? { ...bestWow, unitMetric: wowMetric ?? undefined } : null,
     coles: bestColes ? { ...bestColes, unitMetric: colesMetric ?? undefined } : null,
@@ -348,18 +439,20 @@ app.get("/compare", priceLimit, async (req: Request, res: Response) => {
     fetchedAt: result.fetchedAt,
   };
 
-  res.setHeader("Cache-Control", "public, max-age=180");
+  res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=900");
   res.json(comparison);
 });
 
-// ─── Live Melbourne Coles vs Woolworths Price-Gap Leaderboard ────────────────
+// ─── Live Coles vs Woolworths Price-Gap Leaderboard ──────────────────────────
 
-app.get("/compare/gaps", async (_req: Request, res: Response) => {
-  const gaps = await getColesVsWoolworthsGaps(72);
+app.get("/compare/gaps", async (req: Request, res: Response) => {
+  const ctx = resolveCityAndState(req);
+  const gaps = await singleflight("compare:gaps", () => getColesVsWoolworthsGaps(72));
   const withSavings = gaps.filter((g) => g.savingsAmount >= 0.2);
-  res.setHeader("Cache-Control", "public, max-age=300");
+
+  res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=900");
   res.json({
-    region: "Greater Melbourne, VIC",
+    region: ctx.regionLabel,
     totalMatchedPairs: gaps.length,
     gapsCount: withSavings.length,
     gaps: withSavings.length > 0 ? withSavings.slice(0, 40) : gaps.slice(0, 40),
@@ -367,7 +460,7 @@ app.get("/compare/gaps", async (_req: Request, res: Response) => {
   });
 });
 
-// ─── Verified Price Ingest (from Melbourne iPhone Direct Fetch or Sync Worker)
+// ─── Verified Price & Specials Ingest ────────────────────────────────────────
 
 const ALLOWED_INGEST_RETAILERS = new Set(["Coles", "Woolworths", "ALDI"]);
 
@@ -378,7 +471,8 @@ app.post("/prices/ingest", async (req: Request, res: Response) => {
     return;
   }
 
-  const { productName, suburb = "Melbourne", entries } = req.body ?? {};
+  const { productName, suburb = "Melbourne", state = "VIC", entries } = req.body ?? {};
+  const cleanState = String(state).toUpperCase() === "NSW" ? "NSW" : "VIC";
   if (typeof productName !== "string" || productName.trim().length < 2 || !Array.isArray(entries)) {
     res.status(400).json({ error: "productName and entries[] required" });
     return;
@@ -394,7 +488,6 @@ app.post("/prices/ingest", async (req: Request, res: Response) => {
     if (!Number.isFinite(price) || price < 0.5 || price > 350) continue;
     if (typeof raw.matchedName !== "string" || raw.matchedName.trim().length < 3) continue;
 
-    // Require authentic retailer product URL for Coles/Woolworths ingests to prevent junk data
     if (
       raw.productUrl &&
       typeof raw.productUrl === "string" &&
@@ -408,9 +501,9 @@ app.post("/prices/ingest", async (req: Request, res: Response) => {
 
     valid.push({
       retailer: raw.retailer,
-      storeName: typeof raw.storeName === "string" ? raw.storeName.slice(0, 100) : `${raw.retailer} Online (VIC)`,
+      storeName: typeof raw.storeName === "string" ? raw.storeName.slice(0, 100) : `${raw.retailer} Online (${cleanState})`,
       suburb: String(suburb).slice(0, 60),
-      state: "VIC",
+      state: cleanState,
       matchedName: raw.matchedName.trim().slice(0, 200),
       brand: typeof raw.brand === "string" ? raw.brand.trim().slice(0, 80) : undefined,
       stockcode: raw.stockcode ? String(raw.stockcode).slice(0, 40) : undefined,
@@ -433,16 +526,17 @@ app.post("/prices/ingest", async (req: Request, res: Response) => {
     return;
   }
 
-  await savePrices(productName.trim(), String(suburb), "VIC", valid);
-  // Invalidate cached lookup for this product so next read returns freshly ingested Coles/Woolies pair
-  priceCache.clear();
+  await savePrices(productName.trim(), String(suburb), cleanState, valid);
+  priceCache.delete(`${productName.trim().toLowerCase()}|VIC`);
+  priceCache.delete(`${productName.trim().toLowerCase()}|NSW`);
 
   log("info", "ingested verified prices", {
     product: productName.trim(),
+    state: cleanState,
     retailer: valid[0].retailer,
     count: valid.length,
   });
-  res.status(201).json({ ingested: valid.length, productName: productName.trim() });
+  res.status(201).json({ ingested: valid.length, productName: productName.trim(), state: cleanState });
 });
 
 app.post("/specials/ingest", async (req: Request, res: Response) => {
@@ -503,62 +597,74 @@ app.post("/specials/ingest", async (req: Request, res: Response) => {
 // ─── Real Price History (Postgres) ───────────────────────────────────────────
 
 app.get("/prices/history", async (req: Request, res: Response) => {
-  const { product, suburb = "Melbourne", weeks = "12" } = req.query;
-  const state = "VIC";
-
+  const { product, weeks = "12" } = req.query;
   if (!product || typeof product !== "string" || product.trim().length < 2) {
     res.status(400).json({ error: "product query param required" });
     return;
   }
 
-  const rows = await getPriceHistory(
+  const ctx = resolveCityAndState(req);
+  const cleanSuburb = String(req.query.suburb ?? ctx.defaultSuburb);
+
+  let rows = await getPriceHistory(
     product.trim(),
-    String(suburb),
-    state,
+    cleanSuburb,
+    ctx.state,
     Math.min(Number(weeks) || 12, 52)
   );
+  // Fall back to VIC history if NSW archive is just starting (same national chain pricing)
+  if (rows.length === 0 && ctx.state === "NSW") {
+    rows = await getPriceHistory(product.trim(), "Melbourne", "VIC", Math.min(Number(weeks) || 12, 52));
+  }
 
+  res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600");
   res.json({
     productName: product.trim(),
-    suburb: String(suburb),
-    state,
+    suburb: cleanSuburb,
+    state: ctx.state,
     weeks: rows,
     fetchedAt: new Date().toISOString(),
   });
 });
 
-// ─── Live Melbourne Baby Specials (Woolworths + Coles merged!) ───────────────
+// ─── Live Baby Specials (Woolworths + Coles merged) ──────────────────────────
 
 async function loadLiveSpecials(): Promise<SpecialEntry[]> {
-  const cached = specialsCache.get("melbourne");
+  const cached = specialsCache.get("au");
   if (cached) return cached;
 
-  const [wow, colesLive, dbSpecials] = await Promise.all([
-    fetchWoolworthsBabySpecials(),
-    fetchColesBabySpecials(),
-    loadFreshSpecials(48),
-  ]);
+  return singleflight("specials:au", async () => {
+    const again = specialsCache.get("au");
+    if (again) return again;
 
-  const byId = new Map<string, SpecialEntry>();
-  for (const s of dbSpecials) byId.set(s.id, s);
-  for (const s of [...wow, ...colesLive]) byId.set(s.id, s);
+    const [wow, colesLive, dbSpecials] = await Promise.all([
+      fetchWoolworthsBabySpecials(),
+      fetchColesBabySpecials(),
+      loadFreshSpecials(48),
+    ]);
 
-  if (wow.length + colesLive.length > 0) {
-    upsertSpecials([...wow, ...colesLive]).catch(() => {});
-  }
+    const byId = new Map<string, SpecialEntry>();
+    for (const s of dbSpecials) byId.set(s.id, s);
+    for (const s of [...wow, ...colesLive]) byId.set(s.id, s);
 
-  const merged = [...byId.values()].sort((a, b) => {
-    if (b.savingsPercent !== a.savingsPercent) return b.savingsPercent - a.savingsPercent;
-    return b.savingsAmount - a.savingsAmount;
+    if (wow.length + colesLive.length > 0) {
+      upsertSpecials([...wow, ...colesLive]).catch(() => {});
+    }
+
+    const merged = [...byId.values()].sort((a, b) => {
+      if (b.savingsPercent !== a.savingsPercent) return b.savingsPercent - a.savingsPercent;
+      return b.savingsAmount - a.savingsAmount;
+    });
+
+    if (merged.length > 0) {
+      specialsCache.set("au", merged, 30 * 60 * 1000);
+    }
+    return merged;
   });
-
-  if (merged.length > 0) {
-    specialsCache.set("melbourne", merged, 20 * 60 * 1000);
-  }
-  return merged;
 }
 
 app.get("/specials", async (req: Request, res: Response) => {
+  const ctx = resolveCityAndState(req);
   const category = String(req.query.category ?? "all").toLowerCase();
   const retailer = String(req.query.retailer ?? "all").toLowerCase();
 
@@ -569,16 +675,16 @@ app.get("/specials", async (req: Request, res: Response) => {
     return true;
   });
 
-  res.setHeader("Cache-Control", "public, max-age=300");
+  res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600, stale-while-revalidate=1800");
   res.json({
-    region: "Greater Melbourne, VIC",
+    region: ctx.regionLabel,
     count: filtered.length,
     specials: filtered,
     fetchedAt: new Date().toISOString(),
   });
 });
 
-// ─── Real Greater Melbourne Stores ───────────────────────────────────────────
+// ─── Real Greater Melbourne & Greater Sydney Stores ──────────────────────────
 
 function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6_371_000;
@@ -591,33 +697,37 @@ function haversineMeters(lat1: number, lon1: number, lat2: number, lon2: number)
   return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-async function loadMelbourneStores(): Promise<MelbourneStore[]> {
-  const cached = storesCache.get("melbourne");
+async function loadCityStores(city: SupportedCity): Promise<MelbourneStore[]> {
+  const cached = storesCache.get(city);
   if (cached) return cached;
 
-  const [wow, aldi] = await Promise.all([
-    fetchWoolworthsMelbourneStores(),
-    fetchAldiMelbourneStores(),
-  ]);
-  const combined = [...wow, ...aldi];
-  if (combined.length > 0) {
-    storesCache.set("melbourne", combined, 12 * 60 * 60 * 1000);
-  }
-  log("info", "loaded real Melbourne stores", {
-    woolworths: wow.length,
-    aldi: aldi.length,
-    total: combined.length,
+  return singleflight(`stores:${city}`, async () => {
+    const again = storesCache.get(city);
+    if (again) return again;
+
+    const wow = await fetchWoolworthsCityStores(city);
+    const aldi = city === "melbourne" ? await fetchAldiMelbourneStores() : [];
+    const combined = [...wow, ...aldi];
+    if (combined.length > 0) {
+      storesCache.set(city, combined, 12 * 60 * 60 * 1000);
+    }
+    log("info", `loaded real ${city} stores`, {
+      woolworths: wow.length,
+      aldi: aldi.length,
+      total: combined.length,
+    });
+    return combined;
   });
-  return combined;
 }
 
 app.get("/stores", async (req: Request, res: Response) => {
-  const lat = Number(req.query.lat ?? -37.8136);
-  const lon = Number(req.query.lon ?? 144.9631);
+  const ctx = resolveCityAndState(req);
+  const lat = req.query.lat !== undefined ? Number(req.query.lat) : ctx.defaultLat;
+  const lon = req.query.lon !== undefined ? Number(req.query.lon) : ctx.defaultLon;
   const radius = Math.min(Number(req.query.radius ?? 25_000) || 25_000, 60_000);
   const limit = Math.min(Number(req.query.limit ?? 60) || 60, 200);
 
-  const stores = await loadMelbourneStores();
+  const stores = await loadCityStores(ctx.city);
   const nearby = stores
     .map((s) => ({
       ...s,
@@ -627,9 +737,10 @@ app.get("/stores", async (req: Request, res: Response) => {
     .sort((a, b) => a.distanceMeters - b.distanceMeters)
     .slice(0, limit);
 
-  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=3600");
   res.json({
-    region: "Greater Melbourne, VIC",
+    region: ctx.regionLabel,
+    city: ctx.city,
     count: nearby.length,
     totalTracked: stores.length,
     stores: nearby,
@@ -637,7 +748,7 @@ app.get("/stores", async (req: Request, res: Response) => {
   });
 });
 
-// ─── Official FSANZ + ACCC Recalls ───────────────────────────────────────────
+// ─── Official FSANZ + ACCC Recalls (state-prioritized) ───────────────────────
 
 function toRecallEntry(r: RecallRow): RecallEntry {
   return {
@@ -658,24 +769,35 @@ async function getRecallsList(): Promise<{ recalls: RecallEntry[]; source: strin
   const cached = recallCache.get("all");
   if (cached) return { recalls: cached, source: "cache" };
 
-  const dbRecalls = await loadRecalls();
-  if (dbRecalls.length > 0) {
-    const recalls = dbRecalls.map(toRecallEntry);
-    recallCache.set("all", recalls, 6 * 60 * 60 * 1000);
-    return { recalls, source: "database" };
-  }
+  return singleflight("recalls:all", async () => {
+    const dbRecalls = await loadRecalls();
+    if (dbRecalls.length > 0) {
+      const recalls = dbRecalls.map(toRecallEntry);
+      recallCache.set("all", recalls, 6 * 60 * 60 * 1000);
+      return { recalls, source: "database" };
+    }
 
-  const recalls = await fetchAllOfficialRecalls();
-  recallCache.set("all", recalls, 6 * 60 * 60 * 1000);
-  upsertRecalls(recalls).catch((e) =>
-    log("error", "upsertRecalls failed", { err: (e as Error).message })
-  );
-  return { recalls, source: "live" };
+    const recalls = await fetchAllOfficialRecalls();
+    recallCache.set("all", recalls, 6 * 60 * 60 * 1000);
+    upsertRecalls(recalls).catch((e) =>
+      log("error", "upsertRecalls failed", { err: (e as Error).message })
+    );
+    return { recalls, source: "live" };
+  });
 }
 
-app.get("/recalls", async (_req, res) => {
+app.get("/recalls", async (req: Request, res: Response) => {
+  const ctx = resolveCityAndState(req);
   const { recalls, source } = await getRecallsList();
-  res.json({ recalls, source, fetchedAt: new Date().toISOString() });
+  const stateRe = new RegExp(`\\b(${ctx.state}|National|Australia)\\b`, "i");
+  const sorted = [...recalls].sort((a, b) => {
+    const aHit = stateRe.test(a.reason) ? 1 : 0;
+    const bHit = stateRe.test(b.reason) ? 1 : 0;
+    return bHit - aHit;
+  });
+
+  res.setHeader("Cache-Control", "public, max-age=1800, s-maxage=1800");
+  res.json({ recalls: sorted, state: ctx.state, source, fetchedAt: new Date().toISOString() });
 });
 
 app.get("/recalls/check", async (req: Request, res: Response) => {
@@ -706,14 +828,16 @@ app.get("/recalls/check", async (req: Request, res: Response) => {
     checkedAt: new Date().toISOString(),
   };
 
+  res.setHeader("Cache-Control", "public, max-age=1800, s-maxage=1800");
   res.json(result);
 });
 
-// ─── Real Melbourne Community Shelf Sightings ────────────────────────────────
+// ─── Real Community Shelf Sightings ──────────────────────────────────────────
 
 const VALID_STATES = new Set<StockStateValue>(["onShelf", "runningLow", "likelyGone"]);
 
 app.get("/sightings", async (req: Request, res: Response) => {
+  const ctx = resolveCityAndState(req);
   const productId = typeof req.query.productId === "string" ? req.query.productId.trim() : undefined;
   const storeId = typeof req.query.storeId === "string" ? req.query.storeId.trim() : undefined;
   const hours = Number(req.query.hours ?? 72) || 72;
@@ -721,7 +845,7 @@ app.get("/sightings", async (req: Request, res: Response) => {
 
   const sightings = await getSightings({ productId, storeId, hours, limit });
   res.json({
-    region: "Greater Melbourne, VIC",
+    region: ctx.regionLabel,
     count: sightings.length,
     sightings,
     fetchedAt: new Date().toISOString(),
@@ -764,46 +888,56 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
     note: typeof note === "string" && note.trim() ? note.trim().slice(0, 240) : undefined,
   });
 
-  log("info", "melbourne shelf sighting recorded", {
+  log("info", "shelf sighting recorded", {
     productId: sighting.productId,
     storeId: sighting.storeId,
+    suburb: sighting.suburb,
     state: sighting.state,
   });
 
   res.status(201).json({ sighting });
 });
 
-// ─── Melbourne Live Pulse Telemetry ──────────────────────────────────────────
+// ─── City Live Pulse Telemetry (/pulse + backwards-compatible /melbourne/pulse)
 
-app.get("/melbourne/pulse", async (_req, res) => {
+async function handlePulse(req: Request, res: Response) {
+  const ctx = resolveCityAndState(req);
   const [{ recalls }, specials, sightings24h, stores] = await Promise.all([
     getRecallsList(),
     loadLiveSpecials(),
     countRecentSightings(24),
-    loadMelbourneStores(),
+    loadCityStores(ctx.city),
   ]);
 
   const pulse: MelbournePulse = {
-    region: "Greater Melbourne, VIC",
+    region: ctx.regionLabel,
+    city: ctx.city,
+    state: ctx.state,
     activeRecallsCount: recalls.length,
     liveSpecialsCount: specials.length,
     biggestSavingPercent: specials.length > 0 ? specials[0].savingsPercent : null,
     sightingsLast24h: sightings24h,
     storesTracked: stores.length,
-    retailers: [
-      { name: "Woolworths", mode: "live_api" },
-      { name: "Coles", mode: "live_api" },
-      { name: "ALDI", mode: "live_api" },
-      { name: "Chemist Warehouse", mode: "in_store_only" },
-      { name: "Baby Bunting", mode: "in_store_only" },
-      { name: "Priceline", mode: "in_store_only" },
-    ],
+    retailers:
+      ctx.city === "sydney"
+        ? [
+            { name: "Woolworths", mode: "live_api" },
+            { name: "Coles", mode: "live_api" },
+          ]
+        : [
+            { name: "Woolworths", mode: "live_api" },
+            { name: "Coles", mode: "live_api" },
+            { name: "ALDI", mode: "live_api" },
+          ],
     updatedAt: new Date().toISOString(),
   };
 
-  res.setHeader("Cache-Control", "public, max-age=180");
+  res.setHeader("Cache-Control", "public, max-age=180, s-maxage=180, stale-while-revalidate=600");
   res.json(pulse);
-});
+}
+
+app.get("/pulse", handlePulse);
+app.get("/melbourne/pulse", handlePulse);
 
 // ─── Error middleware ─────────────────────────────────────────────────────────
 
@@ -819,7 +953,6 @@ app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
 // ─── Scheduled refreshes ─────────────────────────────────────────────────────
 
 cron.schedule("0 */6 * * *", async () => {
-  log("info", "cron: refreshing FSANZ + ACCC recalls");
   const recalls = await fetchAllOfficialRecalls();
   recallCache.set("all", recalls, 6 * 60 * 60 * 1000);
   await upsertRecalls(recalls).catch((e) =>
@@ -828,7 +961,6 @@ cron.schedule("0 */6 * * *", async () => {
 });
 
 cron.schedule("30 */4 * * *", async () => {
-  log("info", "cron: refreshing Melbourne baby specials");
   specialsCache.clear();
   await loadLiveSpecials().catch((e) =>
     log("error", "cron specials failed", { err: (e as Error).message })
@@ -836,9 +968,8 @@ cron.schedule("30 */4 * * *", async () => {
 });
 
 cron.schedule("0 3 * * *", async () => {
-  log("info", "cron: refreshing Greater Melbourne store directory");
   storesCache.clear();
-  await loadMelbourneStores().catch((e) =>
+  await Promise.all([loadCityStores("melbourne"), loadCityStores("sydney")]).catch((e) =>
     log("error", "cron stores failed", { err: (e as Error).message })
   );
 });
@@ -846,7 +977,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-melbourne-api listening", { port: PORT });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "2.2.0" });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })
@@ -859,7 +990,7 @@ const server = app.listen(PORT, async () => {
     })
     .catch((e) => log("warn", "startup recall warm failed", { err: (e as Error).message }));
 
-  loadMelbourneStores().catch((e) =>
+  Promise.all([loadCityStores("melbourne"), loadCityStores("sydney")]).catch((e) =>
     log("warn", "startup store warm failed", { err: (e as Error).message })
   );
 });

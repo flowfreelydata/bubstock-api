@@ -321,20 +321,56 @@ function parseWowHours(raw?: WowRawStore["TradingHours"]): TradingHoursEntry[] {
   return [...byDay.values()].sort((a, b) => a.weekday - b.weekday);
 }
 
-const MELBOURNE_GRID: Array<[number, number]> = [
-  [-37.8136, 144.9631],
-  [-37.7200, 144.9800],
-  [-37.8200, 145.1600],
-  [-37.9200, 145.0800],
-  [-38.0400, 145.2000],
-  [-37.8200, 144.8000],
-];
+const CITY_STORE_GRIDS: Record<
+  "melbourne" | "sydney",
+  {
+    stateUpper: "VIC" | "NSW";
+    stateLower: "vic" | "nsw";
+    bounds: { latMin: number; latMax: number; lonMin: number; lonMax: number };
+    grid: Array<[number, number]>;
+  }
+> = {
+  melbourne: {
+    stateUpper: "VIC",
+    stateLower: "vic",
+    bounds: { latMin: -38.30, latMax: -37.50, lonMin: 144.45, lonMax: 145.55 },
+    grid: [
+      [-37.8136, 144.9631],
+      [-37.7200, 144.9800],
+      [-37.8200, 145.1600],
+      [-37.9200, 145.0800],
+      [-38.0400, 145.2000],
+      [-37.8200, 144.8000],
+    ],
+  },
+  sydney: {
+    stateUpper: "NSW",
+    stateLower: "nsw",
+    bounds: { latMin: -34.18, latMax: -33.55, lonMin: 150.60, lonMax: 151.35 },
+    grid: [
+      [-33.8688, 151.2093],
+      [-33.8915, 151.2500],
+      [-33.8900, 151.1400],
+      [-33.7970, 151.1800],
+      [-33.7200, 151.2800],
+      [-33.7300, 150.9800],
+      [-33.8150, 151.0000],
+      [-33.7700, 150.8500],
+      [-33.9200, 150.9200],
+      [-33.9670, 151.1030],
+      [-34.0310, 151.0580],
+    ],
+  },
+};
 
-export async function fetchWoolworthsMelbourneStores(): Promise<MelbourneStore[]> {
+export async function fetchWoolworthsCityStores(
+  city: "melbourne" | "sydney"
+): Promise<MelbourneStore[]> {
+  const cfg = CITY_STORE_GRIDS[city];
   const cookie = await getSession();
   const byId = new Map<string, MelbourneStore>();
 
-  for (const [lat, lon] of MELBOURNE_GRID) {
+  for (const [lat, lon] of cfg.grid) {
     try {
       const qs = new URLSearchParams({
         Max: "45",
@@ -356,16 +392,17 @@ export async function fetchWoolworthsMelbourneStores(): Promise<MelbourneStore[]
       const data = (await r.json()) as { Stores?: WowRawStore[] };
 
       for (const s of data.Stores ?? []) {
-        if (!s.StoreNo || (s.State ?? "").toUpperCase() !== "VIC") continue;
+        if (!s.StoreNo || (s.State ?? "").toUpperCase() !== cfg.stateUpper) continue;
         const slat = Number(s.Latitude);
         const slon = Number(s.Longitude);
+        const b = cfg.bounds;
         if (
           !Number.isFinite(slat) ||
           !Number.isFinite(slon) ||
-          slat < MELB_LAT_MIN ||
-          slat > MELB_LAT_MAX ||
-          slon < MELB_LON_MIN ||
-          slon > MELB_LON_MAX
+          slat < b.latMin ||
+          slat > b.latMax ||
+          slon < b.lonMin ||
+          slon > b.lonMax
         ) {
           continue;
         }
@@ -379,9 +416,9 @@ export async function fetchWoolworthsMelbourneStores(): Promise<MelbourneStore[]
           storeNo: s.StoreNo,
           name: (s.Name ?? s.Suburb ?? "Woolworths").trim(),
           streetAddress: addressParts.join(", ").trim(),
-          suburb: (s.Suburb ?? "Melbourne").trim(),
-          state: "vic",
-          postcode: (s.Postcode ?? "3000").trim(),
+          suburb: (s.Suburb ?? (city === "sydney" ? "Sydney" : "Melbourne")).trim(),
+          state: cfg.stateLower,
+          postcode: (s.Postcode ?? (city === "sydney" ? "2000" : "3000")).trim(),
           latitude: slat,
           longitude: slon,
           phone: s.Phone?.trim() || undefined,
@@ -391,9 +428,13 @@ export async function fetchWoolworthsMelbourneStores(): Promise<MelbourneStore[]
         });
       }
     } catch (err) {
-      console.warn(`[woolworths] store grid (${lat},${lon}) failed:`, (err as Error).message);
+      console.warn(`[woolworths] ${city} store grid (${lat},${lon}) failed:`, (err as Error).message);
     }
   }
 
   return [...byId.values()].sort((a, b) => a.suburb.localeCompare(b.suburb));
+}
+
+export async function fetchWoolworthsMelbourneStores(): Promise<MelbourneStore[]> {
+  return fetchWoolworthsCityStores("melbourne");
 }

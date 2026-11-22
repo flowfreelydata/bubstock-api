@@ -20,8 +20,8 @@ export const pool = hasDbUrl
       ssl: process.env.DATABASE_URL?.includes("railway.internal")
         ? false
         : { rejectUnauthorized: false },
-      max: 10,
-      idleTimeoutMillis: 30_000,
+      max: 6,
+      idleTimeoutMillis: 20_000,
       connectionTimeoutMillis: 5_000,
     })
   : null;

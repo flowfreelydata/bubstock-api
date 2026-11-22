@@ -106,7 +106,7 @@ export interface MelbourneStore {
   name: string;
   streetAddress: string;
   suburb: string;
-  state: "vic";
+  state: "vic" | "nsw";
   postcode: string;
   latitude: number;
   longitude: number;
@@ -161,7 +161,9 @@ export interface PriceGapItem {
 }
 
 export interface MelbournePulse {
-  region: "Greater Melbourne, VIC";
+  region: string;
+  city?: "melbourne" | "sydney";
+  state?: "VIC" | "NSW";
   activeRecallsCount: number;
   liveSpecialsCount: number;
   biggestSavingPercent: number | null;
