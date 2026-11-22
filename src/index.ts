@@ -35,6 +35,8 @@ import {
   saveSighting,
   getSightings,
   countRecentSightings,
+  saveSocialPromo,
+  getRecentSocialPromos,
   pingDB,
   type RecallRow,
 } from "./db.js";
@@ -1021,6 +1023,68 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
   });
 
   res.status(201).json({ sighting });
+});
+
+// ─── Social Shoutout Promo Submissions (TikTok, Instagram, Facebook, YouTube) ─
+
+const ALLOWED_SOCIAL_HOST_RE =
+  /^(www\.|m\.|vm\.|vt\.|mobile\.)?(tiktok\.com|instagram\.com|facebook\.com|fb\.watch|fb\.com|youtube\.com|youtu\.be|threads\.net|x\.com|twitter\.com|reddit\.com)$/i;
+
+app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => {
+  const { platform, postUrl, referralCode, city } = req.body ?? {};
+  if (typeof postUrl !== "string" || postUrl.trim().length < 10) {
+    res.status(400).json({ error: "Please paste a valid public TikTok, Instagram, Facebook or YouTube link." });
+    return;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(postUrl.trim());
+  } catch {
+    res.status(400).json({ error: "That doesn't look like a valid link — include https://..." });
+    return;
+  }
+
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    res.status(400).json({ error: "Link must start with https://" });
+    return;
+  }
+
+  if (!ALLOWED_SOCIAL_HOST_RE.test(parsed.hostname)) {
+    res.status(400).json({
+      error: "Please share a link from TikTok, Instagram, Facebook, YouTube, Threads, X or Reddit.",
+    });
+    return;
+  }
+
+  const cleanUrl = parsed.toString().slice(0, 400);
+  const cleanPlatform = typeof platform === "string" && platform.trim() ? platform.trim().slice(0, 40) : "Social";
+
+  const saved = await saveSocialPromo({
+    platform: cleanPlatform,
+    postUrl: cleanUrl,
+    referralCode: typeof referralCode === "string" ? referralCode.trim().slice(0, 12) : undefined,
+    city: typeof city === "string" ? city.trim().slice(0, 40) : undefined,
+  });
+
+  if (saved.duplicate) {
+    res.status(409).json({ error: "That post link has already been submitted. Share a new post to earn credit." });
+    return;
+  }
+
+  log("info", "social promo submitted", { platform: cleanPlatform, city });
+  res.status(201).json({
+    accepted: true,
+    monthsGranted: 2,
+    message: "2 months of Bubstock+ unlocked! Thanks for spreading the word to Aussie parents.",
+    promo: saved.record,
+  });
+});
+
+app.get("/promo/recent", async (req: Request, res: Response) => {
+  const limit = Number(req.query.limit ?? 50) || 50;
+  const promos = await getRecentSocialPromos(limit);
+  res.json({ count: promos.length, promos });
 });
 
 // ─── City Live Pulse Telemetry (/pulse + backwards-compatible /melbourne/pulse)

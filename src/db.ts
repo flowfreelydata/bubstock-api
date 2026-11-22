@@ -146,6 +146,18 @@ export async function initSchema(): Promise<void> {
 
       CREATE INDEX IF NOT EXISTS idx_sightings_recent
         ON shelf_sightings(reported_at DESC);
+
+      CREATE TABLE IF NOT EXISTS social_promos (
+        id            TEXT PRIMARY KEY,
+        platform      TEXT NOT NULL,
+        post_url      TEXT NOT NULL UNIQUE,
+        referral_code TEXT,
+        city          TEXT,
+        submitted_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_social_promos_recent
+        ON social_promos(submitted_at DESC);
     `);
     console.log("[db] schema ready");
   } finally {
@@ -697,5 +709,74 @@ export async function countRecentSightings(hours = 24): Promise<number> {
     return r.rows[0]?.cnt ?? 0;
   } catch {
     return 0;
+  }
+}
+
+// ─── Social Shoutout Promos (2 Months Free Growth Loop) ──────────────────────
+
+export interface SocialPromoRecord {
+  id: string;
+  platform: string;
+  postUrl: string;
+  referralCode?: string;
+  city?: string;
+  submittedAt: string;
+}
+
+const memoryPromos: SocialPromoRecord[] = [];
+
+export async function saveSocialPromo(input: {
+  platform: string;
+  postUrl: string;
+  referralCode?: string;
+  city?: string;
+}): Promise<{ duplicate: boolean; record?: SocialPromoRecord }> {
+  const id = crypto.randomUUID();
+  const submittedAt = new Date().toISOString();
+  const record: SocialPromoRecord = { id, ...input, submittedAt };
+
+  if (!pool) {
+    if (memoryPromos.some((p) => p.postUrl.toLowerCase() === input.postUrl.toLowerCase())) {
+      return { duplicate: true };
+    }
+    memoryPromos.unshift(record);
+    return { duplicate: false, record };
+  }
+
+  const res = await pool.query(
+    `INSERT INTO social_promos (id, platform, post_url, referral_code, city, submitted_at)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT (post_url) DO NOTHING
+     RETURNING id`,
+    [id, input.platform, input.postUrl, input.referralCode ?? null, input.city ?? null, submittedAt]
+  );
+
+  if (res.rowCount === 0) {
+    return { duplicate: true };
+  }
+  return { duplicate: false, record };
+}
+
+export async function getRecentSocialPromos(limit = 50): Promise<SocialPromoRecord[]> {
+  const capped = Math.min(Math.max(limit, 1), 200);
+  if (!pool) return memoryPromos.slice(0, capped);
+  try {
+    const r = await pool.query(
+      `SELECT id, platform, post_url, referral_code, city, submitted_at
+       FROM social_promos
+       ORDER BY submitted_at DESC
+       LIMIT $1`,
+      [capped]
+    );
+    return r.rows.map((row) => ({
+      id: row.id,
+      platform: row.platform,
+      postUrl: row.post_url,
+      referralCode: row.referral_code ?? undefined,
+      city: row.city ?? undefined,
+      submittedAt: new Date(row.submitted_at).toISOString(),
+    }));
+  } catch {
+    return [];
   }
 }
