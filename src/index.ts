@@ -11,7 +11,11 @@ import {
   fetchWoolworthsCityStores,
 } from "./scrapers/woolworths.js";
 import { searchColesPrices, fetchColesBabySpecials } from "./scrapers/coles.js";
-import { searchAldiPrices, fetchAldiMelbourneStores } from "./scrapers/aldi.js";
+import {
+  searchAldiPrices,
+  findAldiMamiaEquivalent,
+  fetchAldiCityStores,
+} from "./scrapers/aldi.js";
 import { searchIgaPrices, fetchIgaCityStores } from "./scrapers/iga.js";
 import { searchPricelinePrices, fetchPricelineCityStores } from "./scrapers/priceline.js";
 import { fetchAllOfficialRecalls } from "./scrapers/fsanz.js";
@@ -227,7 +231,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "2.4.0",
+    version: "2.5.0",
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
     endpoints: [
@@ -286,17 +290,19 @@ async function resolveMultiRetailerPrices(
     const again = priceCache.get(cacheKey);
     if (again) return { ...again, suburb: cleanSuburb };
 
-    // Query all 5 open live Australian retail APIs in parallel (Woolworths, Coles, IGA, Priceline, ALDI)
-    const includeAldi = state === "VIC";
+    // Query all 5 open live Australian retail APIs in parallel + ALDI Mamia equivalent matcher
+    // (ALDI operates across all 5 mainland states: VIC, NSW, QLD, WA, SA — not TAS)
+    const includeAldi = state !== "TAS";
 
-    const [wowRes, colesLiveRes, igaRes, pricelineRes, aldiRes] = await Promise.all([
+    const [wowRes, colesLiveRes, igaRes, pricelineRes, aldiRes, aldiEquivalent] = await Promise.all([
       searchWoolworthsPrices(cleanProduct, cleanSuburb, state),
       searchColesPrices(cleanProduct, cleanSuburb, state),
       searchIgaPrices(cleanProduct, cleanSuburb, state),
       searchPricelinePrices(cleanProduct, cleanSuburb, state),
+      searchAldiPrices(cleanProduct, cleanSuburb, state),
       includeAldi
-        ? searchAldiPrices(cleanProduct, cleanSuburb, state)
-        : Promise.resolve(null),
+        ? findAldiMamiaEquivalent(cleanProduct, cleanSuburb, state)
+        : Promise.resolve(undefined),
     ]);
 
     let wowEntries = wowRes.entries;
@@ -404,12 +410,22 @@ async function resolveMultiRetailerPrices(
         ? scored.map((s) => s.entry)
         : allRaw.sort((a, b) => a.price - b.price);
 
+    const aldiFinalStatus: RetailerFeedStatus =
+      aldiRes.entries.length === 0 && aldiEquivalent
+        ? {
+            ...aldiRes.status,
+            status: "live",
+            count: 1,
+            note: `Live ALDI Mamia equivalent (${aldiEquivalent.categoryLabel} · $${aldiEquivalent.entry.price.toFixed(2)})`,
+          }
+        : aldiRes.status;
+
     const retailerStatus: RetailerFeedStatus[] = [
       wowStatus,
       colesStatus,
       igaStatus,
       pricelineStatus,
-      ...(aldiRes ? [aldiRes.status] : []),
+      aldiFinalStatus,
       {
         retailer: "Chemist Warehouse",
         status: "unavailable",
@@ -432,6 +448,7 @@ async function resolveMultiRetailerPrices(
       state,
       entries,
       retailerStatus,
+      aldiEquivalent,
       fetchedAt: new Date().toISOString(),
     };
 
@@ -830,7 +847,7 @@ async function loadCityStores(city: AuCity): Promise<MelbourneStore[]> {
       fetchWoolworthsCityStores(city),
       fetchIgaCityStores(city),
       fetchPricelineCityStores(city),
-      city === "melbourne" ? fetchAldiMelbourneStores() : Promise.resolve([]),
+      fetchAldiCityStores(city),
     ]);
     const combined = [...wow, ...iga, ...priceline, ...aldi];
     if (combined.length > 0) {
@@ -1112,7 +1129,7 @@ async function handlePulse(req: Request, res: Response) {
       { name: "Coles", mode: "live_api" },
       { name: "IGA", mode: "live_api" },
       { name: "Priceline Pharmacy", mode: "live_api" },
-      ...(ctx.city === "melbourne" ? [{ name: "ALDI", mode: "live_api" as const }] : []),
+      ...(ctx.city !== "tasmania" ? [{ name: "ALDI", mode: "live_api" as const }] : []),
       { name: "Chemist Warehouse", mode: "in_store_only" },
       { name: "Baby Bunting", mode: "in_store_only" },
     ],
@@ -1164,7 +1181,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "2.4.0" });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "2.5.0" });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

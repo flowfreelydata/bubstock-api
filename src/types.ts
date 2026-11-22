@@ -34,6 +34,12 @@ export interface PriceEntry {
   lastUpdated: string;
 }
 
+export interface AldiEquivalent {
+  categoryLabel: string;
+  entry: PriceEntry;
+  note: string;
+}
+
 export interface ProductPriceResult {
   productName: string;
   barcode?: string;
@@ -41,6 +47,7 @@ export interface ProductPriceResult {
   state: string;
   entries: PriceEntry[];
   retailerStatus: RetailerFeedStatus[];
+  aldiEquivalent?: AldiEquivalent;
   fetchedAt: string;
 }
 
