@@ -116,6 +116,50 @@ export interface MelbourneStore {
   source: "woolworths_api" | "aldi_api";
 }
 
+export interface HeadToHeadComparison {
+  query: string;
+  suburb: string;
+  state: string;
+  matchQuality: "exact" | "unit_matched" | "single_retailer" | "no_match";
+  woolworths: (PriceEntry & { unitMetric?: { value: number; label: string } }) | null;
+  coles: (PriceEntry & { unitMetric?: { value: number; label: string } }) | null;
+  cheaperRetailer: "Woolworths" | "Coles" | "Tie" | null;
+  priceDifference: number | null;
+  percentDifference: number | null;
+  unitSummary: string | null;
+  retailerStatus: RetailerFeedStatus[];
+  fetchedAt: string;
+}
+
+export interface PriceGapItem {
+  productKey: string;
+  displayName: string;
+  matchQuality: "exact" | "unit_matched";
+  woolworths: {
+    matchedName: string;
+    price: number;
+    wasPrice?: number;
+    unit: string;
+    isInStock?: boolean;
+    imageUrl?: string;
+    productUrl?: string;
+    lastUpdated: string;
+  };
+  coles: {
+    matchedName: string;
+    price: number;
+    wasPrice?: number;
+    unit: string;
+    isInStock?: boolean;
+    imageUrl?: string;
+    productUrl?: string;
+    lastUpdated: string;
+  };
+  cheaperRetailer: "Woolworths" | "Coles" | "Tie";
+  savingsAmount: number;
+  savingsPercent: number;
+}
+
 export interface MelbournePulse {
   region: "Greater Melbourne, VIC";
   activeRecallsCount: number;

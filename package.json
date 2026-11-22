@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "sync:coles": "tsx src/sync-coles.ts"
   },
   "dependencies": {
     "axios": "^1.7.9",

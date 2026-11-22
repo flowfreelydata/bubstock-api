@@ -1,6 +1,14 @@
 import pg from "pg";
 import crypto from "node:crypto";
-import type { PriceEntry, RecallEntry, ShelfSighting, StockStateValue } from "./types.js";
+import type {
+  PriceEntry,
+  PriceGapItem,
+  RecallEntry,
+  ShelfSighting,
+  SpecialEntry,
+  StockStateValue,
+} from "./types.js";
+import { classifyPairMatch, pickBestMatch } from "./matcher.js";
 
 const { Pool } = pg;
 
@@ -22,9 +30,8 @@ pool?.on("error", (err) => {
   console.error("[db] pool error:", err.message);
 });
 
-// In-memory store ONLY used when running without DATABASE_URL (local dev).
-// On Railway, PostgreSQL is the single source of truth.
 const memorySightings: ShelfSighting[] = [];
+const memorySpecials = new Map<string, SpecialEntry>();
 
 export async function pingDB(): Promise<boolean> {
   if (!pool) return false;
@@ -73,8 +80,32 @@ export async function initSchema(): Promise<void> {
       CREATE INDEX IF NOT EXISTS idx_price_lookup
         ON price_entries(lower(product_name), lower(suburb), state, fetched_at DESC);
 
+      CREATE INDEX IF NOT EXISTS idx_price_retailer_recent
+        ON price_entries(retailer, lower(product_name), fetched_at DESC);
+
       CREATE INDEX IF NOT EXISTS idx_price_matched
         ON price_entries(lower(matched_name), fetched_at DESC);
+
+      CREATE TABLE IF NOT EXISTS special_entries (
+        id              TEXT PRIMARY KEY,
+        retailer        TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        brand           TEXT,
+        category        TEXT NOT NULL,
+        price           NUMERIC(8,2) NOT NULL,
+        was_price       NUMERIC(8,2) NOT NULL,
+        savings_amount  NUMERIC(8,2) NOT NULL,
+        savings_percent INT NOT NULL,
+        unit            TEXT,
+        is_in_stock     BOOLEAN,
+        image_url       TEXT,
+        product_url     TEXT,
+        sale_ends_at    TEXT,
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_specials_updated
+        ON special_entries(updated_at DESC);
 
       CREATE TABLE IF NOT EXISTS recall_entries (
         fsanz_id           TEXT PRIMARY KEY,
@@ -164,9 +195,182 @@ export async function savePrices(
   }
 }
 
+/**
+ * Loads fresh verified prices for a retailer (e.g. Coles synced from Melbourne)
+ * recorded within the last `maxAgeHours`. Deduplicates by stockcode/matched_name,
+ * returning the newest observation per SKU.
+ */
+export async function getFreshRetailerPrices(
+  productQuery: string,
+  retailer: string,
+  maxAgeHours = 36
+): Promise<PriceEntry[]> {
+  if (!pool) return [];
+  const clean = productQuery.trim().toLowerCase();
+  const tokens = clean
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 2)
+    .slice(0, 4);
+  if (tokens.length === 0) return [];
+
+  try {
+    const tokenClauses = tokens.map(
+      (_t, i) => `(lower(product_name) LIKE '%' || $${i + 3} || '%' OR lower(matched_name) LIKE '%' || $${i + 3} || '%')`
+    );
+    const result = await pool.query(
+      `SELECT DISTINCT ON (COALESCE(stockcode, lower(matched_name)))
+         retailer, store_name, suburb, state,
+         price::FLOAT8 AS price,
+         was_price::FLOAT8 AS was_price,
+         unit, is_on_sale, is_in_stock, matched_name, stockcode, image_url, product_url, fetched_at
+       FROM price_entries
+       WHERE retailer = $1
+         AND fetched_at >= NOW() - ($2 || ' hours')::INTERVAL
+         AND (
+           lower(product_name) = lower($3)
+           OR (${tokenClauses.join(" AND ")})
+         )
+       ORDER BY COALESCE(stockcode, lower(matched_name)), fetched_at DESC
+       LIMIT 16`,
+      [retailer, maxAgeHours, ...tokens]
+    );
+
+    return result.rows.map((r) => {
+      const was = r.was_price && r.was_price > r.price ? Number(r.was_price) : undefined;
+      const savingsPercent = was ? Math.round(((was - r.price) / was) * 100) : undefined;
+      return {
+        retailer: r.retailer,
+        storeName: r.store_name ?? `${r.retailer} VIC`,
+        suburb: r.suburb ?? "Melbourne",
+        state: r.state ?? "VIC",
+        matchedName: r.matched_name ?? productQuery,
+        stockcode: r.stockcode ?? undefined,
+        price: Number(r.price),
+        wasPrice: was,
+        savingsPercent,
+        currency: "AUD" as const,
+        unit: r.unit ?? "",
+        isOnSale: Boolean(r.is_on_sale),
+        isInStock: typeof r.is_in_stock === "boolean" ? r.is_in_stock : undefined,
+        imageUrl: r.image_url ?? undefined,
+        productUrl: r.product_url ?? undefined,
+        lastUpdated: new Date(r.fetched_at).toISOString(),
+      };
+    });
+  } catch (err) {
+    console.error("[db] getFreshRetailerPrices error:", (err as Error).message);
+    return [];
+  }
+}
+
+/**
+ * Computes real verified Coles vs Woolworths price gaps across all products
+ * observed in both retailers within the last 48 hours.
+ */
+export async function getColesVsWoolworthsGaps(maxAgeHours = 48): Promise<PriceGapItem[]> {
+  if (!pool) return [];
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT ON (lower(product_name), retailer, COALESCE(stockcode, lower(matched_name)))
+         lower(product_name) AS product_key,
+         retailer,
+         price::FLOAT8 AS price,
+         was_price::FLOAT8 AS was_price,
+         unit, is_on_sale, is_in_stock, matched_name, stockcode, image_url, product_url, fetched_at
+       FROM price_entries
+       WHERE retailer IN ('Woolworths', 'Coles')
+         AND fetched_at >= NOW() - ($1 || ' hours')::INTERVAL
+       ORDER BY lower(product_name), retailer, COALESCE(stockcode, lower(matched_name)), fetched_at DESC`,
+      [maxAgeHours]
+    );
+
+    // Group by product_key
+    const grouped = new Map<string, { wow: PriceEntry[]; coles: PriceEntry[] }>();
+    for (const r of result.rows) {
+      const key = String(r.product_key);
+      const bucket = grouped.get(key) ?? { wow: [], coles: [] };
+      const entry: PriceEntry = {
+        retailer: r.retailer,
+        storeName: `${r.retailer} VIC`,
+        suburb: "Melbourne",
+        state: "VIC",
+        matchedName: r.matched_name ?? key,
+        stockcode: r.stockcode ?? undefined,
+        price: Number(r.price),
+        wasPrice: r.was_price && r.was_price > r.price ? Number(r.was_price) : undefined,
+        currency: "AUD",
+        unit: r.unit ?? "",
+        isOnSale: Boolean(r.is_on_sale),
+        isInStock: typeof r.is_in_stock === "boolean" ? r.is_in_stock : undefined,
+        imageUrl: r.image_url ?? undefined,
+        productUrl: r.product_url ?? undefined,
+        lastUpdated: new Date(r.fetched_at).toISOString(),
+      };
+      if (r.retailer === "Woolworths") bucket.wow.push(entry);
+      else bucket.coles.push(entry);
+      grouped.set(key, bucket);
+    }
+
+    const gaps: PriceGapItem[] = [];
+    for (const [productKey, { wow, coles }] of grouped) {
+      if (wow.length === 0 || coles.length === 0) continue;
+      const bestWow = pickBestMatch(productKey, wow);
+      const bestColes = pickBestMatch(productKey, coles);
+      if (!bestWow || !bestColes) continue;
+
+      const matchQuality = classifyPairMatch(bestWow, bestColes);
+      const diff = Number(Math.abs(bestWow.price - bestColes.price).toFixed(2));
+      const higher = Math.max(bestWow.price, bestColes.price);
+      const pct = higher > 0 ? Math.round((diff / higher) * 100) : 0;
+      const cheaperRetailer: "Woolworths" | "Coles" | "Tie" =
+        diff < 0.05 ? "Tie" : bestColes.price < bestWow.price ? "Coles" : "Woolworths";
+
+      gaps.push({
+        productKey,
+        displayName: bestWow.matchedName.length <= bestColes.matchedName.length
+          ? bestWow.matchedName
+          : bestColes.matchedName,
+        matchQuality,
+        woolworths: {
+          matchedName: bestWow.matchedName,
+          price: bestWow.price,
+          wasPrice: bestWow.wasPrice,
+          unit: bestWow.unit,
+          isInStock: bestWow.isInStock,
+          imageUrl: bestWow.imageUrl,
+          productUrl: bestWow.productUrl,
+          lastUpdated: bestWow.lastUpdated,
+        },
+        coles: {
+          matchedName: bestColes.matchedName,
+          price: bestColes.price,
+          wasPrice: bestColes.wasPrice,
+          unit: bestColes.unit,
+          isInStock: bestColes.isInStock,
+          imageUrl: bestColes.imageUrl,
+          productUrl: bestColes.productUrl,
+          lastUpdated: bestColes.lastUpdated,
+        },
+        cheaperRetailer,
+        savingsAmount: diff,
+        savingsPercent: pct,
+      });
+    }
+
+    return gaps.sort((a, b) => {
+      if (b.savingsAmount !== a.savingsAmount) return b.savingsAmount - a.savingsAmount;
+      return b.savingsPercent - a.savingsPercent;
+    });
+  } catch (err) {
+    console.error("[db] getColesVsWoolworthsGaps error:", (err as Error).message);
+    return [];
+  }
+}
+
 export async function getPriceHistory(
   productName: string,
-  suburb: string,
+  _suburb: string,
   state: string,
   weeks = 12
 ): Promise<
@@ -180,7 +384,6 @@ export async function getPriceHistory(
 > {
   if (!pool) return [];
   try {
-    // Match across VIC (Melbourne-wide prices are uniform per retailer chain)
     const result = await pool.query(
       `SELECT
          TO_CHAR(DATE_TRUNC('week', fetched_at), 'YYYY-MM-DD') AS week,
@@ -199,6 +402,98 @@ export async function getPriceHistory(
     return result.rows;
   } catch (err) {
     console.error("[db] getPriceHistory error:", (err as Error).message);
+    return [];
+  }
+}
+
+// ─── Specials persistence (merges Woolworths + Coles specials) ───────────────
+
+export async function upsertSpecials(specials: SpecialEntry[]): Promise<void> {
+  if (specials.length === 0) return;
+  if (!pool) {
+    for (const s of specials) memorySpecials.set(s.id, s);
+    return;
+  }
+  const client = await pool.connect();
+  try {
+    for (const s of specials) {
+      await client.query(
+        `INSERT INTO special_entries
+           (id, retailer, name, brand, category, price, was_price,
+            savings_amount, savings_percent, unit, is_in_stock, image_url, product_url, sale_ends_at, updated_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
+         ON CONFLICT (id) DO UPDATE
+           SET name            = EXCLUDED.name,
+               price           = EXCLUDED.price,
+               was_price       = EXCLUDED.was_price,
+               savings_amount  = EXCLUDED.savings_amount,
+               savings_percent = EXCLUDED.savings_percent,
+               unit            = EXCLUDED.unit,
+               is_in_stock     = EXCLUDED.is_in_stock,
+               image_url       = EXCLUDED.image_url,
+               product_url     = EXCLUDED.product_url,
+               updated_at      = NOW()`,
+        [
+          s.id,
+          s.retailer,
+          s.name,
+          s.brand ?? null,
+          s.category,
+          s.price,
+          s.wasPrice,
+          s.savingsAmount,
+          s.savingsPercent,
+          s.unit,
+          s.isInStock ?? null,
+          s.imageUrl ?? null,
+          s.productUrl ?? null,
+          s.saleEndsAt ?? null,
+        ]
+      );
+    }
+  } catch (err) {
+    console.error("[db] upsertSpecials error:", (err as Error).message);
+  } finally {
+    client.release();
+  }
+}
+
+export async function loadFreshSpecials(maxAgeHours = 36): Promise<SpecialEntry[]> {
+  if (!pool) {
+    return [...memorySpecials.values()];
+  }
+  try {
+    const result = await pool.query(
+      `SELECT id, retailer, name, brand, category,
+              price::FLOAT8 AS price,
+              was_price::FLOAT8 AS was_price,
+              savings_amount::FLOAT8 AS savings_amount,
+              savings_percent, unit, is_in_stock, image_url, product_url, sale_ends_at, updated_at
+       FROM special_entries
+       WHERE updated_at >= NOW() - ($1 || ' hours')::INTERVAL
+       ORDER BY savings_percent DESC, savings_amount DESC
+       LIMIT 200`,
+      [maxAgeHours]
+    );
+    return result.rows.map((r) => ({
+      id: r.id,
+      retailer: r.retailer,
+      name: r.name,
+      brand: r.brand ?? undefined,
+      category: r.category,
+      price: Number(r.price),
+      wasPrice: Number(r.was_price),
+      savingsAmount: Number(r.savings_amount),
+      savingsPercent: Number(r.savings_percent),
+      unit: r.unit ?? "",
+      isInStock: typeof r.is_in_stock === "boolean" ? r.is_in_stock : undefined,
+      imageUrl: r.image_url ?? undefined,
+      productUrl: r.product_url ?? undefined,
+      saleEndsAt: r.sale_ends_at ?? undefined,
+      lastUpdated: new Date(r.updated_at).toISOString(),
+    }));
+  } catch (err) {
+    console.error("[db] loadFreshSpecials error:", (err as Error).message);
     return [];
   }
 }
@@ -346,8 +641,8 @@ export async function getSightings(opts: {
     const cutoff = Date.now() - hours * 3600 * 1000;
     return memorySightings
       .filter((s) => new Date(s.reportedAt).getTime() >= cutoff)
-      .filter((s) => (!opts.productId || s.productId === opts.productId))
-      .filter((s) => (!opts.storeId || s.storeId === opts.storeId))
+      .filter((s) => !opts.productId || s.productId === opts.productId)
+      .filter((s) => !opts.storeId || s.storeId === opts.storeId)
       .slice(0, limit);
   }
 
