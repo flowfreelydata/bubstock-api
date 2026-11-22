@@ -1,25 +1,66 @@
+export type FeedStatusKind = "live" | "no_match" | "unavailable";
+
+export interface RetailerFeedStatus {
+  retailer: string;
+  status: FeedStatusKind;
+  count: number;
+  latencyMs: number;
+  note?: string;
+}
+
 export interface PriceEntry {
   retailer: string;
   storeName: string;
   suburb: string;
   state: string;
+  matchedName: string;
+  brand?: string;
+  stockcode?: string;
+  barcode?: string;
   price: number;
+  wasPrice?: number;
+  savingsPercent?: number;
   currency: "AUD";
   unit: string;
   isOnSale: boolean;
   saleEndsAt?: string;
+  isInStock?: boolean;
+  imageUrl?: string;
+  productUrl?: string;
   lastUpdated: string;
 }
 
 export interface ProductPriceResult {
   productName: string;
   barcode?: string;
+  suburb: string;
+  state: string;
   entries: PriceEntry[];
+  retailerStatus: RetailerFeedStatus[];
   fetchedAt: string;
+}
+
+export interface SpecialEntry {
+  id: string;
+  retailer: string;
+  name: string;
+  brand?: string;
+  category: "formula" | "pouch" | "nappies" | "cereal" | "snack" | "other";
+  price: number;
+  wasPrice: number;
+  savingsAmount: number;
+  savingsPercent: number;
+  unit: string;
+  isInStock?: boolean;
+  imageUrl?: string;
+  productUrl?: string;
+  saleEndsAt?: string;
+  lastUpdated: string;
 }
 
 export interface RecallEntry {
   id: string;
+  agency: "FSANZ" | "ACCC";
   productName: string;
   brand: string;
   recallDate: string;
@@ -34,4 +75,54 @@ export interface RecallCheckResult {
   recalled: boolean;
   matches: RecallEntry[];
   checkedAt: string;
+}
+
+export type StockStateValue = "onShelf" | "runningLow" | "likelyGone";
+
+export interface ShelfSighting {
+  id: string;
+  productId: string;
+  productName?: string;
+  storeId: string;
+  storeName: string;
+  suburb: string;
+  retailer: string;
+  state: StockStateValue;
+  observedPrice?: number;
+  note?: string;
+  reportedAt: string;
+}
+
+export interface TradingHoursEntry {
+  weekday: number; // 1 = Sun ... 7 = Sat (matches Swift Calendar)
+  openMinute: number;
+  closeMinute: number;
+}
+
+export interface MelbourneStore {
+  id: string;
+  retailer: "woolworths" | "coles" | "aldi" | "iga" | "chemistWarehouse" | "priceline" | "babyBunting" | "costco";
+  storeNo?: string;
+  name: string;
+  streetAddress: string;
+  suburb: string;
+  state: "vic";
+  postcode: string;
+  latitude: number;
+  longitude: number;
+  phone?: string;
+  hours: TradingHoursEntry[];
+  hasDedicatedBabyAisle: boolean;
+  source: "woolworths_api" | "aldi_api";
+}
+
+export interface MelbournePulse {
+  region: "Greater Melbourne, VIC";
+  activeRecallsCount: number;
+  liveSpecialsCount: number;
+  biggestSavingPercent: number | null;
+  sightingsLast24h: number;
+  storesTracked: number;
+  retailers: Array<{ name: string; mode: "live_api" | "in_store_only" }>;
+  updatedAt: string;
 }

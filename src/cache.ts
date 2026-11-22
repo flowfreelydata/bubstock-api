@@ -1,3 +1,10 @@
+import type {
+  MelbourneStore,
+  ProductPriceResult,
+  RecallEntry,
+  SpecialEntry,
+} from "./types.js";
+
 interface CacheEntry<T> {
   data: T;
   expiresAt: number;
@@ -7,8 +14,6 @@ class TTLCache<T> {
   private store = new Map<string, CacheEntry<T>>();
 
   constructor() {
-    // Proactively evict expired entries every 5 min so the Map doesn't grow
-    // unboundedly on a long-running Railway process.
     setInterval(() => this.evict(), 5 * 60 * 1000).unref();
   }
 
@@ -46,5 +51,7 @@ class TTLCache<T> {
   }
 }
 
-export const priceCache = new TTLCache<import("./types.js").ProductPriceResult>();
-export const recallCache = new TTLCache<import("./types.js").RecallEntry[]>();
+export const priceCache = new TTLCache<ProductPriceResult>();
+export const recallCache = new TTLCache<RecallEntry[]>();
+export const specialsCache = new TTLCache<SpecialEntry[]>();
+export const storesCache = new TTLCache<MelbourneStore[]>();
