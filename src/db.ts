@@ -8,7 +8,7 @@ import type {
   SpecialEntry,
   StockStateValue,
 } from "./types.js";
-import { areComparablePair, classifyPairMatch, pickBestMatch } from "./matcher.js";
+import { areComparablePair, classifyPairMatch, pickBestComparablePair } from "./matcher.js";
 
 const { Pool } = pg;
 
@@ -315,8 +315,7 @@ export async function getColesVsWoolworthsGaps(maxAgeHours = 48): Promise<PriceG
     const gaps: PriceGapItem[] = [];
     for (const [productKey, { wow, coles }] of grouped) {
       if (wow.length === 0 || coles.length === 0) continue;
-      const bestWow = pickBestMatch(productKey, wow);
-      const bestColes = pickBestMatch(productKey, coles);
+      const { wow: bestWow, coles: bestColes } = pickBestComparablePair(productKey, wow, coles);
       if (!bestWow || !bestColes) continue;
       if (!areComparablePair(bestWow, bestColes)) continue;
 

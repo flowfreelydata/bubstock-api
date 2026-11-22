@@ -322,6 +322,45 @@ export function pickBestMatch(query: string, entries: PriceEntry[]): PriceEntry 
   return best;
 }
 
+/**
+ * Jointly picks the highest-scoring mutually comparable (Woolworths, Coles) pair
+ * so e.g. a 44-pack at Woolworths pairs with the exact 44-pack at Coles even when
+ * Woolworths also lists a 90-pack jumbo box.
+ */
+export function pickBestComparablePair(
+  query: string,
+  wowPool: PriceEntry[],
+  colesPool: PriceEntry[]
+): { wow: PriceEntry | null; coles: PriceEntry | null } {
+  const scoredWow = wowPool
+    .map((e) => ({ e, s: matchScore(query, e) }))
+    .filter((x) => x.s >= 0);
+  const scoredColes = colesPool
+    .map((e) => ({ e, s: matchScore(query, e) }))
+    .filter((x) => x.s >= 0);
+
+  let bestPair: { wow: PriceEntry; coles: PriceEntry; total: number } | null = null;
+
+  for (const w of scoredWow) {
+    for (const c of scoredColes) {
+      if (!areComparablePair(w.e, c.e)) continue;
+      const exactBonus = classifyPairMatch(w.e, c.e) === "exact" ? 20 : 0;
+      const total = w.s + c.s + exactBonus;
+      if (!bestPair || total > bestPair.total) {
+        bestPair = { wow: w.e, coles: c.e, total };
+      }
+    }
+  }
+
+  if (bestPair) {
+    return { wow: bestPair.wow, coles: bestPair.coles };
+  }
+  return {
+    wow: pickBestMatch(query, wowPool),
+    coles: pickBestMatch(query, colesPool),
+  };
+}
+
 export function classifyPairMatch(
   wow: PriceEntry,
   coles: PriceEntry

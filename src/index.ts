@@ -34,7 +34,7 @@ import {
   classifyPairMatch,
   computeUnitMetric,
   matchScore,
-  pickBestMatch,
+  pickBestComparablePair,
 } from "./matcher.js";
 import type {
   HeadToHeadComparison,
@@ -268,10 +268,10 @@ app.get("/compare", priceLimit, async (req: Request, res: Response) => {
   const wowPool = result.entries.filter((e) => e.retailer === "Woolworths");
   const colesPool = result.entries.filter((e) => e.retailer === "Coles");
 
-  const bestWow = pickBestMatch(cleanProduct, wowPool);
-  let bestColes = pickBestMatch(cleanProduct, colesPool);
+  const paired = pickBestComparablePair(cleanProduct, wowPool, colesPool);
+  const bestWow = paired.wow;
+  let bestColes = paired.coles;
   if (bestWow && bestColes && !areComparablePair(bestWow, bestColes)) {
-    // Reject non-comparable pair (e.g. bulk carton vs normal pack or different sub-line)
     bestColes = null;
   }
 
