@@ -157,6 +157,22 @@ async function resolveMultiRetailerPrices(
     searchAldiPrices(cleanProduct, cleanSuburb, state),
   ]);
 
+  let wowEntries = wowRes.entries;
+  let wowStatus: RetailerFeedStatus = wowRes.status;
+  if (wowEntries.length === 0) {
+    const dbWow = await getFreshRetailerPrices(cleanProduct, "Woolworths", 48);
+    if (dbWow.length > 0) {
+      wowEntries = dbWow;
+      wowStatus = {
+        retailer: "Woolworths",
+        status: "live",
+        count: dbWow.length,
+        latencyMs: wowRes.status.latencyMs,
+        note: "Verified Woolworths VIC price (Postgres sync)",
+      };
+    }
+  }
+
   let colesEntries = colesLiveRes.entries;
   let colesStatus: RetailerFeedStatus = colesLiveRes.status;
 
@@ -182,7 +198,7 @@ async function resolveMultiRetailerPrices(
   }
 
   // Filter out egregious mismatches (e.g. $4 sachets when looking up a 900g tin) while keeping valid hits
-  const allRaw = [...wowRes.entries, ...colesEntries, ...aldiRes.entries];
+  const allRaw = [...wowEntries, ...colesEntries, ...aldiRes.entries];
   const scored = allRaw
     .map((entry) => ({ entry, score: matchScore(cleanProduct, entry) }))
     .filter((item) => item.score >= 0)
@@ -198,7 +214,7 @@ async function resolveMultiRetailerPrices(
       : allRaw.sort((a, b) => a.price - b.price);
 
   const retailerStatus: RetailerFeedStatus[] = [
-    wowRes.status,
+    wowStatus,
     colesStatus,
     aldiRes.status,
     {
