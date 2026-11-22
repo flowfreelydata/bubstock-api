@@ -4,6 +4,7 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import cron from "node-cron";
+import crypto from "node:crypto";
 import zlib from "node:zlib";
 import {
   searchWoolworthsPrices,
@@ -156,8 +157,26 @@ function resolveCityAndState(req: Request): CityContext {
 }
 
 const app = express();
+app.disable("x-powered-by");
 app.set("trust proxy", 1);
 const PORT = Number(process.env.PORT ?? 3000);
+
+function sanitizeText(input: unknown, maxLen: number): string {
+  if (typeof input !== "string") return "";
+  return input
+    .replace(/[\u0000-\u001F\u007F<>]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
+function timingSafeKeyMatch(provided: unknown, expected: string | undefined): boolean {
+  if (!expected || typeof provided !== "string") return false;
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
 
 function log(level: "info" | "warn" | "error", msg: string, extra?: object) {
   console[level === "error" ? "error" : "log"](
@@ -222,6 +241,14 @@ const sightingLimit = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many shelf reports — please wait a minute" },
+});
+
+const ingestLimit = rateLimit({
+  windowMs: 60_000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Ingest rate limit exceeded — slow down" },
 });
 
 app.use(generalLimit);
@@ -472,15 +499,14 @@ async function resolveMultiRetailerPrices(
 // ─── Live Multi-Retailer Prices ──────────────────────────────────────────────
 
 app.get("/prices", priceLimit, async (req: Request, res: Response) => {
-  const { product } = req.query;
-  if (!product || typeof product !== "string" || product.trim().length < 2) {
-    res.status(400).json({ error: "product query param required (min 2 chars)" });
+  const cleanProduct = sanitizeText(req.query.product, 120);
+  if (cleanProduct.length < 2) {
+    res.status(400).json({ error: "product query param required (2-120 chars)" });
     return;
   }
 
   const ctx = resolveCityAndState(req);
-  const cleanProduct = product.trim();
-  const cleanSuburb = String(req.query.suburb ?? ctx.defaultSuburb).trim() || ctx.defaultSuburb;
+  const cleanSuburb = sanitizeText(req.query.suburb, 60) || ctx.defaultSuburb;
 
   log("info", "live price lookup", {
     product: cleanProduct,
@@ -497,15 +523,14 @@ app.get("/prices", priceLimit, async (req: Request, res: Response) => {
 // ─── Exact Canonical Coles vs Woolworths Head-to-Head Compare ────────────────
 
 app.get("/compare", priceLimit, async (req: Request, res: Response) => {
-  const { product } = req.query;
-  if (!product || typeof product !== "string" || product.trim().length < 2) {
-    res.status(400).json({ error: "product query param required (min 2 chars)" });
+  const cleanProduct = sanitizeText(req.query.product, 120);
+  if (cleanProduct.length < 2) {
+    res.status(400).json({ error: "product query param required (2-120 chars)" });
     return;
   }
 
   const ctx = resolveCityAndState(req);
-  const cleanProduct = product.trim();
-  const cleanSuburb = String(req.query.suburb ?? ctx.defaultSuburb).trim() || ctx.defaultSuburb;
+  const cleanSuburb = sanitizeText(req.query.suburb, 60) || ctx.defaultSuburb;
   const result = await resolveMultiRetailerPrices(cleanProduct, cleanSuburb, ctx.state);
 
   const wowPool = result.entries.filter((e) => e.retailer === "Woolworths");
@@ -600,17 +625,19 @@ app.get("/compare/gaps", async (req: Request, res: Response) => {
 
 const ALLOWED_INGEST_RETAILERS = new Set(["Coles", "Woolworths", "IGA", "Priceline", "ALDI"]);
 
-app.post("/prices/ingest", async (req: Request, res: Response) => {
+app.post("/prices/ingest", ingestLimit, async (req: Request, res: Response) => {
   const ingestKey = process.env.INGEST_API_KEY;
-  if (ingestKey && req.headers["x-ingest-key"] !== ingestKey) {
+  if (ingestKey && !timingSafeKeyMatch(req.headers["x-ingest-key"], ingestKey)) {
     res.status(401).json({ error: "Unauthorized ingest key" });
     return;
   }
 
   const { productName, suburb = "Melbourne", state = "VIC", entries } = req.body ?? {};
+  const cleanProductName = sanitizeText(productName, 140);
+  const cleanSuburb = sanitizeText(suburb, 60) || "Melbourne";
   const upperState = String(state).toUpperCase() as AuStateUpper;
   const cleanState: AuStateUpper = VALID_AU_STATES.has(upperState) ? upperState : "VIC";
-  if (typeof productName !== "string" || productName.trim().length < 2 || !Array.isArray(entries)) {
+  if (cleanProductName.length < 2 || !Array.isArray(entries)) {
     res.status(400).json({ error: "productName and entries[] required" });
     return;
   }
@@ -663,23 +690,23 @@ app.post("/prices/ingest", async (req: Request, res: Response) => {
     return;
   }
 
-  await savePrices(productName.trim(), String(suburb), cleanState, valid);
+  await savePrices(cleanProductName, cleanSuburb, cleanState, valid);
   for (const st of VALID_AU_STATES) {
-    priceCache.delete(`${productName.trim().toLowerCase()}|${st}`);
+    priceCache.delete(`${cleanProductName.toLowerCase()}|${st}`);
   }
 
   log("info", "ingested verified prices", {
-    product: productName.trim(),
+    product: cleanProductName,
     state: cleanState,
     retailer: valid[0].retailer,
     count: valid.length,
   });
-  res.status(201).json({ ingested: valid.length, productName: productName.trim(), state: cleanState });
+  res.status(201).json({ ingested: valid.length, productName: cleanProductName, state: cleanState });
 });
 
-app.post("/specials/ingest", async (req: Request, res: Response) => {
+app.post("/specials/ingest", ingestLimit, async (req: Request, res: Response) => {
   const ingestKey = process.env.INGEST_API_KEY;
-  if (ingestKey && req.headers["x-ingest-key"] !== ingestKey) {
+  if (ingestKey && !timingSafeKeyMatch(req.headers["x-ingest-key"], ingestKey)) {
     res.status(401).json({ error: "Unauthorized ingest key" });
     return;
   }
@@ -1000,15 +1027,11 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
   const { productId, productName, storeId, storeName, suburb, retailer, state, observedPrice, note } =
     req.body ?? {};
 
-  if (
-    typeof productId !== "string" ||
-    productId.trim().length < 2 ||
-    typeof storeId !== "string" ||
-    storeId.trim().length < 2 ||
-    typeof storeName !== "string" ||
-    storeName.trim().length < 2 ||
-    !VALID_STATES.has(state)
-  ) {
+  const cleanProductId = sanitizeText(productId, 120);
+  const cleanStoreId = sanitizeText(storeId, 120);
+  const cleanStoreName = sanitizeText(storeName, 120);
+
+  if (cleanProductId.length < 2 || cleanStoreId.length < 2 || cleanStoreName.length < 2 || !VALID_STATES.has(state)) {
     res.status(400).json({
       error: "productId, storeId, storeName, and valid state (onShelf|runningLow|likelyGone) required",
     });
@@ -1021,15 +1044,15 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
       : undefined;
 
   const sighting = await saveSighting({
-    productId: productId.trim().slice(0, 120),
-    productName: typeof productName === "string" ? productName.trim().slice(0, 160) : undefined,
-    storeId: storeId.trim().slice(0, 120),
-    storeName: storeName.trim().slice(0, 120),
-    suburb: typeof suburb === "string" && suburb.trim() ? suburb.trim().slice(0, 80) : "Melbourne",
-    retailer: typeof retailer === "string" && retailer.trim() ? retailer.trim().slice(0, 60) : "Unknown",
+    productId: cleanProductId,
+    productName: sanitizeText(productName, 160) || undefined,
+    storeId: cleanStoreId,
+    storeName: cleanStoreName,
+    suburb: sanitizeText(suburb, 80) || "Melbourne",
+    retailer: sanitizeText(retailer, 60) || "Unknown",
     state,
     observedPrice: parsedPrice,
-    note: typeof note === "string" && note.trim() ? note.trim().slice(0, 240) : undefined,
+    note: sanitizeText(note, 240) || undefined,
   });
 
   log("info", "shelf sighting recorded", {
@@ -1099,7 +1122,13 @@ app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => 
 });
 
 app.get("/promo/recent", async (req: Request, res: Response) => {
-  const limit = Number(req.query.limit ?? 50) || 50;
+  // Protected admin-only endpoint — prevents public scraping of submitted social URLs & referral codes.
+  const adminKey = process.env.ADMIN_API_KEY ?? process.env.INGEST_API_KEY;
+  if (!adminKey || !timingSafeKeyMatch(req.headers["x-admin-key"] ?? req.headers["x-ingest-key"], adminKey)) {
+    res.status(403).json({ error: "Forbidden — admin key required" });
+    return;
+  }
+  const limit = Math.min(Math.max(Number(req.query.limit ?? 50) || 50, 1), 100);
   const promos = await getRecentSocialPromos(limit);
   res.json({ count: promos.length, promos });
 });
