@@ -50,6 +50,9 @@ import {
   clearInvalidApnsToken,
   upsertHouseholdVault,
   getHouseholdVault,
+  registerReferralCode,
+  redeemReferralCode,
+  hasDeviceVerifiedPromoOrReferral,
   createMothersGroup,
   joinMothersGroup,
   getMothersGroup,
@@ -62,6 +65,7 @@ import {
   type WatchedAlertRule,
 } from "./db.js";
 import {
+  SEO_FLAGSHIP_SLUGS,
   renderCostIndexPage,
   renderHalfPriceDealsPage,
   renderProductCityPricePage,
@@ -208,11 +212,87 @@ function log(level: "info" | "warn" | "error", msg: string, extra?: object) {
   );
 }
 
-// ─── Security, gzip compression & middleware ──────────────────────────────────
+// ─── Security, strict CORS, anti-leech guard & gzip compression ──────────────
+
+const ALLOWED_BROWSER_ORIGINS = new Set([
+  "https://bubstock-api-production.up.railway.app",
+  "https://bubstock.com.au",
+  "https://www.bubstock.com.au",
+]);
+
+const SCRAPER_BOT_UA_RE =
+  /\b(python-requests|python-urllib|scrapy|aiohttp|httpx|go-http-client|wget|libwww-perl|java\/|okhttp|axios\/|node-fetch|puppeteer|playwright|selenium|headlesschrome)\b/i;
+
+const ALLOWED_IMAGE_URL_RE =
+  /^https:\/\/([a-z0-9-]+\.)?(woolworths\.com\.au|woolworths\.media|coles\.com\.au|igashop\.com\.au|priceline\.com\.au|aldi\.com\.au|aldi\.cx|chemistwarehouse\.com\.au|babybunting\.com\.au)\//i;
+
+const SEO_FLAGSHIP_SLUG_SET = new Set(SEO_FLAGSHIP_SLUGS);
+
+function isValidStoreKitJws(jws: unknown): boolean {
+  if (typeof jws !== "string") return false;
+  const parts = jws.trim().split(".");
+  if (parts.length !== 3) return false;
+  try {
+    const header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")) as {
+      alg?: string;
+      x5c?: unknown[];
+    };
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as {
+      bundleId?: string;
+      productId?: string;
+      expiresDate?: number;
+    };
+    if (header.alg !== "ES256" || !Array.isArray(header.x5c) || header.x5c.length === 0) {
+      return false;
+    }
+    if (payload.bundleId !== "au.com.bubstock.app") return false;
+    if (
+      payload.productId !== "au.com.bubstock.plus.monthly" &&
+      payload.productId !== "au.com.bubstock.plus.yearly"
+    ) {
+      return false;
+    }
+    if (typeof payload.expiresDate === "number" && payload.expiresDate < Date.now() - 60_000) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(cors({ origin: "*" }));
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Native iOS URLSession, Widgets & Siri requests send no browser Origin header
+      if (!origin || ALLOWED_BROWSER_ORIGINS.has(origin.toLowerCase())) {
+        callback(null, true);
+        return;
+      }
+      callback(null, false);
+    },
+    methods: ["GET", "POST"],
+  })
+);
 app.use(express.json({ limit: "256kb" }));
+
+// Block automated third-party scraper libraries on JSON API routes & forbid indexing raw JSON
+function antiLeechGuard(req: Request, res: Response, next: NextFunction): void {
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  const ua = String(req.headers["user-agent"] ?? "");
+  const origin = String(req.headers["origin"] ?? "");
+  if (origin && !ALLOWED_BROWSER_ORIGINS.has(origin.toLowerCase())) {
+    res.status(403).json({ error: "Cross-origin API access is not permitted" });
+    return;
+  }
+  if (SCRAPER_BOT_UA_RE.test(ua)) {
+    log("warn", "blocked automated scraper UA on JSON API", { path: req.path, ua: ua.slice(0, 80) });
+    res.status(403).json({ error: "Automated bulk scraping is not permitted" });
+    return;
+  }
+  next();
+}
 
 // Zero-dependency gzip compression for JSON payloads > 1 KB (cuts Railway egress ~80%)
 app.use((req: Request, res: Response, next: NextFunction) => {
@@ -275,6 +355,30 @@ const ingestLimit = rateLimit({
   message: { error: "Ingest rate limit exceeded — slow down" },
 });
 
+const dataDumpLimit = rateLimit({
+  windowMs: 60_000,
+  max: 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many data requests — please slow down" },
+});
+
+const vaultWriteLimit = rateLimit({
+  windowMs: 5 * 60_000,
+  max: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Household sync write limit exceeded — try again in a few minutes" },
+});
+
+const vaultReadLimit = rateLimit({
+  windowMs: 60_000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many household sync reads — slow down" },
+});
+
 app.use(generalLimit);
 
 // ─── Root & Health ────────────────────────────────────────────────────────────
@@ -282,7 +386,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "2.8.0",
+    version: "2.9.0",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
@@ -533,7 +637,7 @@ async function resolveMultiRetailerPrices(
 
 // ─── Live Multi-Retailer Prices ──────────────────────────────────────────────
 
-app.get("/prices", priceLimit, async (req: Request, res: Response) => {
+app.get("/prices", antiLeechGuard, priceLimit, async (req: Request, res: Response) => {
   const cleanProduct = sanitizeText(req.query.product, 120);
   if (cleanProduct.length < 2) {
     res.status(400).json({ error: "product query param required (2-120 chars)" });
@@ -557,7 +661,7 @@ app.get("/prices", priceLimit, async (req: Request, res: Response) => {
 
 // ─── Exact Canonical Coles vs Woolworths Head-to-Head Compare ────────────────
 
-app.get("/compare", priceLimit, async (req: Request, res: Response) => {
+app.get("/compare", antiLeechGuard, priceLimit, async (req: Request, res: Response) => {
   const cleanProduct = sanitizeText(req.query.product, 120);
   if (cleanProduct.length < 2) {
     res.status(400).json({ error: "product query param required (2-120 chars)" });
@@ -641,7 +745,7 @@ app.get("/compare", priceLimit, async (req: Request, res: Response) => {
 
 // ─── Live Coles vs Woolworths Price-Gap Leaderboard ──────────────────────────
 
-app.get("/compare/gaps", async (req: Request, res: Response) => {
+app.get("/compare/gaps", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   const ctx = resolveCityAndState(req);
   const gaps = await singleflight("compare:gaps", () => getColesVsWoolworthsGaps(72));
   const withSavings = gaps.filter((g) => g.savingsAmount >= 0.2);
@@ -661,9 +765,10 @@ app.get("/compare/gaps", async (req: Request, res: Response) => {
 const ALLOWED_INGEST_RETAILERS = new Set(["Coles", "Woolworths", "IGA", "Priceline", "ALDI"]);
 
 app.post("/prices/ingest", ingestLimit, async (req: Request, res: Response) => {
+  // FAIL-CLOSED: INGEST_API_KEY must be configured in Railway and supplied via x-ingest-key
   const ingestKey = process.env.INGEST_API_KEY;
-  if (ingestKey && !timingSafeKeyMatch(req.headers["x-ingest-key"], ingestKey)) {
-    res.status(401).json({ error: "Unauthorized ingest key" });
+  if (!ingestKey || !timingSafeKeyMatch(req.headers["x-ingest-key"], ingestKey)) {
+    res.status(403).json({ error: "Forbidden — valid ingest key required" });
     return;
   }
 
@@ -698,6 +803,11 @@ app.post("/prices/ingest", ingestLimit, async (req: Request, res: Response) => {
     const wasPrice =
       raw.wasPrice && Number(raw.wasPrice) > price ? Number(Number(raw.wasPrice).toFixed(2)) : undefined;
 
+    const safeImageUrl =
+      typeof raw.imageUrl === "string" && ALLOWED_IMAGE_URL_RE.test(raw.imageUrl)
+        ? raw.imageUrl.slice(0, 400)
+        : undefined;
+
     valid.push({
       retailer: raw.retailer,
       storeName: typeof raw.storeName === "string" ? raw.storeName.slice(0, 100) : `${raw.retailer} Online (${cleanState})`,
@@ -714,7 +824,7 @@ app.post("/prices/ingest", ingestLimit, async (req: Request, res: Response) => {
       unit: typeof raw.unit === "string" ? raw.unit.slice(0, 60) : "",
       isOnSale: Boolean(raw.isOnSale || wasPrice),
       isInStock: typeof raw.isInStock === "boolean" ? raw.isInStock : undefined,
-      imageUrl: typeof raw.imageUrl === "string" ? raw.imageUrl.slice(0, 400) : undefined,
+      imageUrl: safeImageUrl,
       productUrl: typeof raw.productUrl === "string" ? raw.productUrl.slice(0, 400) : undefined,
       lastUpdated: nowIso,
     });
@@ -740,9 +850,10 @@ app.post("/prices/ingest", ingestLimit, async (req: Request, res: Response) => {
 });
 
 app.post("/specials/ingest", ingestLimit, async (req: Request, res: Response) => {
+  // FAIL-CLOSED: INGEST_API_KEY must be configured in Railway and supplied via x-ingest-key
   const ingestKey = process.env.INGEST_API_KEY;
-  if (ingestKey && !timingSafeKeyMatch(req.headers["x-ingest-key"], ingestKey)) {
-    res.status(401).json({ error: "Unauthorized ingest key" });
+  if (!ingestKey || !timingSafeKeyMatch(req.headers["x-ingest-key"], ingestKey)) {
+    res.status(403).json({ error: "Forbidden — valid ingest key required" });
     return;
   }
 
@@ -765,6 +876,16 @@ app.post("/specials/ingest", ingestLimit, async (req: Request, res: Response) =>
     const savingsPercent = Math.round((savingsAmount / wasPrice) * 100);
     if (savingsPercent < 5) continue;
 
+    const safeImageUrl =
+      typeof s.imageUrl === "string" && ALLOWED_IMAGE_URL_RE.test(s.imageUrl)
+        ? s.imageUrl.slice(0, 400)
+        : undefined;
+    const safeProductUrl =
+      typeof s.productUrl === "string" &&
+      /^https:\/\/www\.(coles|woolworths|aldi|priceline)\.com\.au\/|^https:\/\/www\.igashop\.com\.au\//i.test(s.productUrl)
+        ? s.productUrl.slice(0, 400)
+        : undefined;
+
     valid.push({
       id: s.id.slice(0, 80),
       retailer: s.retailer,
@@ -777,8 +898,8 @@ app.post("/specials/ingest", ingestLimit, async (req: Request, res: Response) =>
       savingsPercent,
       unit: typeof s.unit === "string" ? s.unit.slice(0, 60) : "",
       isInStock: typeof s.isInStock === "boolean" ? s.isInStock : undefined,
-      imageUrl: typeof s.imageUrl === "string" ? s.imageUrl.slice(0, 400) : undefined,
-      productUrl: typeof s.productUrl === "string" ? s.productUrl.slice(0, 400) : undefined,
+      imageUrl: safeImageUrl,
+      productUrl: safeProductUrl,
       lastUpdated: nowIso,
     });
   }
@@ -863,7 +984,7 @@ async function loadLiveSpecials(): Promise<SpecialEntry[]> {
   });
 }
 
-app.get("/specials", async (req: Request, res: Response) => {
+app.get("/specials", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   const ctx = resolveCityAndState(req);
   const category = String(req.query.category ?? "all").toLowerCase();
   const retailer = String(req.query.retailer ?? "all").toLowerCase();
@@ -926,7 +1047,7 @@ async function loadCityStores(city: AuCity): Promise<MelbourneStore[]> {
   });
 }
 
-app.get("/stores", async (req: Request, res: Response) => {
+app.get("/stores", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   const ctx = resolveCityAndState(req);
   const lat = req.query.lat !== undefined ? Number(req.query.lat) : ctx.defaultLat;
   const lon = req.query.lon !== undefined ? Number(req.query.lon) : ctx.defaultLon;
@@ -1135,9 +1256,9 @@ const ALLOWED_SOCIAL_HOST_RE =
   /^(www\.|m\.|vm\.|vt\.|mobile\.)?(tiktok\.com|instagram\.com|facebook\.com|fb\.watch|fb\.com|youtube\.com|youtu\.be|threads\.net|x\.com|twitter\.com|reddit\.com)$/i;
 
 app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => {
-  const { platform, postUrl, referralCode, city } = req.body ?? {};
-  if (typeof postUrl !== "string" || postUrl.trim().length < 10) {
-    res.status(400).json({ error: "Please paste a valid public TikTok, Instagram, Facebook or YouTube link." });
+  const { platform, postUrl, referralCode, city, deviceId } = req.body ?? {};
+  if (typeof postUrl !== "string" || postUrl.trim().length < 16) {
+    res.status(400).json({ error: "Please paste a valid public TikTok, Instagram, Facebook or YouTube post link." });
     return;
   }
 
@@ -1149,7 +1270,7 @@ app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => 
     return;
   }
 
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+  if (parsed.protocol !== "https:") {
     res.status(400).json({ error: "Link must start with https://" });
     return;
   }
@@ -1161,6 +1282,30 @@ app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => 
     return;
   }
 
+  const segments = parsed.pathname.split("/").filter((s) => s.length >= 2);
+  if (segments.length < 2 && !parsed.searchParams.has("v")) {
+    res.status(400).json({
+      error: "Please paste the direct link to your post or video (not just the homepage).",
+    });
+    return;
+  }
+
+  // Fast live reachability check: reject blatantly nonexistent 404/410 links while tolerating 403/302 bot gates
+  try {
+    const probe = await fetch(parsed.toString(), {
+      method: "HEAD",
+      redirect: "follow",
+      signal: AbortSignal.timeout(4_000),
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; BubstockLinkCheck/1.0)" },
+    });
+    if (probe.status === 404 || probe.status === 410) {
+      res.status(400).json({ error: "That post link returned 404 (not found). Make sure your post is public and try again." });
+      return;
+    }
+  } catch {
+    // Tolerate social platform network timeouts gracefully
+  }
+
   const cleanUrl = parsed.toString().slice(0, 400);
   const cleanPlatform = typeof platform === "string" && platform.trim() ? platform.trim().slice(0, 40) : "Social";
 
@@ -1169,7 +1314,13 @@ app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => 
     postUrl: cleanUrl,
     referralCode: typeof referralCode === "string" ? referralCode.trim().slice(0, 12) : undefined,
     city: typeof city === "string" ? city.trim().slice(0, 40) : undefined,
+    deviceId: sanitizeText(deviceId, 80) || req.ip,
   });
+
+  if (saved.alreadyClaimedByDevice) {
+    res.status(409).json({ error: "This device has already claimed its 2-month social shoutout reward." });
+    return;
+  }
 
   if (saved.duplicate) {
     res.status(409).json({ error: "That post link has already been submitted. Share a new post to earn credit." });
@@ -1180,7 +1331,7 @@ app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => 
   res.status(201).json({
     accepted: true,
     monthsGranted: 2,
-    message: "2 months of Bubstock+ unlocked! Thanks for spreading the word to Aussie parents.",
+    message: "2 months of Bubstock+ Preview unlocked! Thanks for spreading the word to Aussie parents.",
     promo: saved.record,
   });
 });
@@ -1300,6 +1451,7 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
   const {
     deviceId,
     apnsToken,
+    storekitJws,
     city = "melbourne",
     state = "VIC",
     hasPlus = false,
@@ -1315,6 +1467,14 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
     return;
   }
 
+  // Server-side entitlement verification: do not trust self-declared `hasPlus: true`
+  // unless backed by a StoreKit 2 signed ES256 JWS transaction or verified Postgres preview claim.
+  const verifiedStoreKit = isValidStoreKitJws(storekitJws);
+  const verifiedPreview = !verifiedStoreKit && hasPlus
+    ? await hasDeviceVerifiedPromoOrReferral(cleanDeviceId)
+    : false;
+  const effectiveHasPlus = Boolean(hasPlus) && (verifiedStoreKit || verifiedPreview);
+
   const cleanToken =
     typeof apnsToken === "string"
       ? apnsToken.replace(/[^a-fA-F0-9]/g, "").slice(0, 160) || undefined
@@ -1325,7 +1485,7 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
     ? alertCategories.map((c) => String(c).toLowerCase()).filter((c) => VALID_ALERT_CATEGORIES.has(c))
     : ["nappies", "formula"];
   const cleanRules: WatchedAlertRule[] = Array.isArray(watchedRules)
-    ? watchedRules.slice(0, hasPlus ? 30 : 2).flatMap((r) => {
+    ? watchedRules.slice(0, effectiveHasPlus ? 20 : 2).flatMap((r) => {
         if (!r || typeof r !== "object") return [];
         const productId = sanitizeText((r as any).productId, 80);
         const name = sanitizeText((r as any).name, 140);
@@ -1341,8 +1501,8 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
     apnsToken: cleanToken,
     city: sanitizeText(city, 30) || "melbourne",
     state: cleanState,
-    hasPlus: Boolean(hasPlus),
-    halfPriceEnabled: Boolean(halfPriceEnabled),
+    hasPlus: effectiveHasPlus,
+    halfPriceEnabled: effectiveHasPlus && Boolean(halfPriceEnabled),
     minDiscountPercent: Math.min(Math.max(Number(minDiscountPercent) || 40, 20), 60),
     alertCategories: cleanCats.length > 0 ? cleanCats : ["nappies", "formula"],
     watchedRules: cleanRules,
@@ -1350,6 +1510,7 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
 
   res.status(200).json({
     synced: true,
+    verifiedPlus: effectiveHasPlus,
     apnsEnabled: isApnsConfigured() && Boolean(cleanToken),
     rulesCount: cleanRules.length,
   });
@@ -1452,14 +1613,15 @@ async function handlePulse(req: Request, res: Response) {
 app.get("/pulse", handlePulse);
 app.get("/melbourne/pulse", handlePulse);
 
-// ─── Zero-Knowledge E2EE Two-Parent Household Sync ───────────────────────────
+// ─── Zero-Knowledge E2EE Two-Parent Household Sync (Write-Proof Protected) ───
 
-app.post("/household/sync", sightingLimit, async (req: Request, res: Response) => {
+app.post("/household/sync", antiLeechGuard, vaultWriteLimit, async (req: Request, res: Response) => {
   const vaultId = typeof req.body?.vaultId === "string" ? req.body.vaultId.trim().toLowerCase() : "";
+  const writeToken = typeof req.body?.writeToken === "string" ? req.body.writeToken.trim().toLowerCase() : "";
   const ciphertext = typeof req.body?.ciphertext === "string" ? req.body.ciphertext.trim() : "";
 
-  if (!/^[a-f0-9]{32,64}$/.test(vaultId)) {
-    res.status(400).json({ error: "Invalid vaultId (must be 32-64 hex chars)" });
+  if (!/^[a-f0-9]{32,64}$/.test(vaultId) || !/^[a-f0-9]{32,64}$/.test(writeToken)) {
+    res.status(400).json({ error: "Valid vaultId and writeToken required" });
     return;
   }
   if (ciphertext.length < 16 || ciphertext.length > 65_536) {
@@ -1467,17 +1629,27 @@ app.post("/household/sync", sightingLimit, async (req: Request, res: Response) =
     return;
   }
 
-  const saved = await upsertHouseholdVault(vaultId, ciphertext);
+  const saved = await upsertHouseholdVault(vaultId, writeToken, ciphertext);
+  if (saved.forbidden) {
+    res.status(403).json({ error: "Forbidden — invalid household write proof" });
+    return;
+  }
+  if (saved.storageFull) {
+    res.status(503).json({ error: "Household sync capacity reached — try again later" });
+    return;
+  }
+  res.setHeader("Cache-Control", "no-store, private");
   res.status(200).json({ synced: true, updatedAt: saved.updatedAt });
 });
 
-app.get("/household/sync/:vaultId", async (req: Request, res: Response) => {
+app.get("/household/sync/:vaultId", antiLeechGuard, vaultReadLimit, async (req: Request, res: Response) => {
   const vaultId = String(req.params.vaultId ?? "").trim().toLowerCase();
   if (!/^[a-f0-9]{32,64}$/.test(vaultId)) {
     res.status(400).json({ error: "Invalid vaultId" });
     return;
   }
   const vault = await getHouseholdVault(vaultId);
+  res.setHeader("Cache-Control", "no-store, private");
   if (!vault) {
     res.status(404).json({ error: "Household vault not found yet" });
     return;
@@ -1485,7 +1657,31 @@ app.get("/household/sync/:vaultId", async (req: Request, res: Response) => {
   res.json(vault);
 });
 
-// ─── Mothers' Group / Playgroup Syndicate (Viral 3-Family Loop) ──────────────
+// ─── Server-Verified Referral Codes ──────────────────────────────────────────
+
+app.post("/referrals/register", sightingLimit, async (req: Request, res: Response) => {
+  const code = sanitizeText(req.body?.code, 12);
+  const deviceId = sanitizeText(req.body?.deviceId, 80);
+  if (code.length !== 6 || deviceId.length < 6) {
+    res.status(400).json({ error: "Valid 6-char code and deviceId required" });
+    return;
+  }
+  await registerReferralCode(code, deviceId);
+  res.status(200).json({ registered: true });
+});
+
+app.post("/referrals/redeem", sightingLimit, async (req: Request, res: Response) => {
+  const code = sanitizeText(req.body?.code, 12);
+  const deviceId = sanitizeText(req.body?.deviceId, 80);
+  const result = await redeemReferralCode(code, deviceId);
+  res.status(result.status).json({
+    accepted: result.accepted,
+    monthsGranted: result.accepted ? 2 : 0,
+    message: result.message,
+  });
+});
+
+// ─── Mothers' Group / Playgroup Syndicate (Sybil-Resistant 3-Family Loop) ────
 
 app.post("/groups/create", sightingLimit, async (req: Request, res: Response) => {
   const suburb = sanitizeText(req.body?.suburb, 60) || "Melbourne";
@@ -1495,7 +1691,7 @@ app.post("/groups/create", sightingLimit, async (req: Request, res: Response) =>
     res.status(400).json({ error: "deviceId required" });
     return;
   }
-  const status = await createMothersGroup(suburb, city, deviceId);
+  const status = await createMothersGroup(suburb, city, deviceId, req.ip);
   res.status(201).json(status);
 });
 
@@ -1506,12 +1702,16 @@ app.post("/groups/join", sightingLimit, async (req: Request, res: Response) => {
     res.status(400).json({ error: "Valid groupCode and deviceId required" });
     return;
   }
-  const status = await joinMothersGroup(groupCode, deviceId);
-  if (!status) {
+  const result = await joinMothersGroup(groupCode, deviceId, req.ip);
+  if (result.sybilBlocked) {
+    res.status(429).json({ error: "At least 2 different networks/households are required to unlock a 3-mum Syndicate." });
+    return;
+  }
+  if (!result.status) {
     res.status(404).json({ error: "Mothers' Group code not found. Double-check the 6-character code." });
     return;
   }
-  res.json(status);
+  res.json(result.status);
 });
 
 app.get("/groups/:code", async (req: Request, res: Response) => {
@@ -1525,7 +1725,7 @@ app.get("/groups/:code", async (req: Request, res: Response) => {
 
 // ─── Real-Time Suburb Shortage Heatmap & 90-Day Shrinkflation Detector ───────
 
-app.get("/shortages", async (req: Request, res: Response) => {
+app.get("/shortages", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   const hours = Number(req.query.hours ?? 24) || 24;
   const shortages = await getSuburbShortages(hours);
   res.setHeader("Cache-Control", "public, max-age=120, s-maxage=120");
@@ -1536,7 +1736,7 @@ app.get("/shortages", async (req: Request, res: Response) => {
   });
 });
 
-app.get("/shrinkflation", async (req: Request, res: Response) => {
+app.get("/shrinkflation", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   const product = typeof req.query.product === "string" ? sanitizeText(req.query.product, 120) : undefined;
   const alerts = await detectShrinkflation(product);
   res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600");
@@ -1590,7 +1790,7 @@ async function buildCostIndexData(): Promise<{
   };
 }
 
-app.get("/index/au", async (_req: Request, res: Response) => {
+app.get("/index/au", antiLeechGuard, dataDumpLimit, async (_req: Request, res: Response) => {
   const { index } = await buildCostIndexData();
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
   res.json(index);
@@ -1611,14 +1811,15 @@ app.get("/au/half-price-baby-deals", async (_req: Request, res: Response) => {
 });
 
 app.get("/au/prices/:city/:slug", priceLimit, async (req: Request, res: Response) => {
-  const rawCity = String(req.params.city ?? "melbourne").toLowerCase() as AuCity;
-  const ctx = CITY_CONTEXTS[rawCity] ?? CITY_CONTEXTS.melbourne;
+  const rawCity = String(req.params.city ?? "").toLowerCase() as AuCity;
+  const ctx = CITY_CONTEXTS[rawCity];
   const rawSlug = sanitizeText(req.params.slug, 100).toLowerCase();
-  const productQuery = rawSlug.replace(/[^a-z0-9]+/g, " ").trim();
-  if (productQuery.length < 2) {
-    res.status(400).send("Invalid product slug");
+  // Anti-cache-busting & anti-scraper-amplification: only render allowlisted flagship SEO slugs
+  if (!ctx || !SEO_FLAGSHIP_SLUG_SET.has(rawSlug)) {
+    res.status(404).type("text/plain").send("Not found");
     return;
   }
+  const productQuery = rawSlug.replace(/[^a-z0-9]+/g, " ").trim();
   const result = await resolveMultiRetailerPrices(productQuery, ctx.defaultSuburb, ctx.state);
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600");
@@ -1690,7 +1891,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "2.8.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "2.9.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

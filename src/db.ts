@@ -19,7 +19,7 @@ export const pool = hasDbUrl
       connectionString: process.env.DATABASE_URL,
       ssl: process.env.DATABASE_URL?.includes("railway.internal")
         ? false
-        : { rejectUnauthorized: false },
+        : { rejectUnauthorized: process.env.PG_SSL_ALLOW_SELF_SIGNED !== "true" },
       max: 6,
       idleTimeoutMillis: 20_000,
       connectionTimeoutMillis: 5_000,
@@ -156,8 +156,11 @@ export async function initSchema(): Promise<void> {
         post_url      TEXT NOT NULL UNIQUE,
         referral_code TEXT,
         city          TEXT,
+        device_hash   TEXT,
         submitted_at  TIMESTAMPTZ DEFAULT NOW()
       );
+
+      ALTER TABLE social_promos ADD COLUMN IF NOT EXISTS device_hash TEXT;
 
       CREATE INDEX IF NOT EXISTS idx_social_promos_recent
         ON social_promos(submitted_at DESC);
@@ -186,17 +189,36 @@ export async function initSchema(): Promise<void> {
         ON sent_push_alerts(sent_at DESC);
 
       CREATE TABLE IF NOT EXISTS household_vaults (
-        vault_id    TEXT PRIMARY KEY,
-        ciphertext  TEXT NOT NULL,
-        updated_at  TIMESTAMPTZ DEFAULT NOW()
+        vault_id        TEXT PRIMARY KEY,
+        write_token_hash TEXT,
+        ciphertext      TEXT NOT NULL,
+        updated_at      TIMESTAMPTZ DEFAULT NOW()
       );
 
+      ALTER TABLE household_vaults ADD COLUMN IF NOT EXISTS write_token_hash TEXT;
+
       CREATE TABLE IF NOT EXISTS mothers_groups (
-        group_code    TEXT PRIMARY KEY,
-        suburb        TEXT NOT NULL,
-        city          TEXT NOT NULL,
-        member_hashes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-        created_at    TIMESTAMPTZ DEFAULT NOW()
+        group_code      TEXT PRIMARY KEY,
+        suburb          TEXT NOT NULL,
+        city            TEXT NOT NULL,
+        member_hashes   TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        member_ip_hashes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        created_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      ALTER TABLE mothers_groups ADD COLUMN IF NOT EXISTS member_ip_hashes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+
+      CREATE TABLE IF NOT EXISTS referral_codes (
+        code              TEXT PRIMARY KEY,
+        owner_device_hash TEXT NOT NULL,
+        redeemer_hashes   TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        created_at        TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS device_promo_claims (
+        device_hash TEXT PRIMARY KEY,
+        kind        TEXT NOT NULL,
+        claimed_at  TIMESTAMPTZ DEFAULT NOW()
       );
     `);
     console.log("[db] schema ready");
@@ -919,10 +941,12 @@ export async function saveSocialPromo(input: {
   postUrl: string;
   referralCode?: string;
   city?: string;
-}): Promise<{ duplicate: boolean; record?: SocialPromoRecord }> {
+  deviceId?: string;
+}): Promise<{ duplicate: boolean; alreadyClaimedByDevice?: boolean; record?: SocialPromoRecord }> {
   const id = crypto.randomUUID();
   const submittedAt = new Date().toISOString();
-  const record: SocialPromoRecord = { id, ...input, submittedAt };
+  const devHash = hashDeviceId(input.deviceId);
+  const record: SocialPromoRecord = { id, platform: input.platform, postUrl: input.postUrl, referralCode: input.referralCode, city: input.city, submittedAt };
 
   if (!pool) {
     if (memoryPromos.some((p) => p.postUrl.toLowerCase() === input.postUrl.toLowerCase())) {
@@ -932,16 +956,33 @@ export async function saveSocialPromo(input: {
     return { duplicate: false, record };
   }
 
+  if (devHash) {
+    const existing = await pool.query(
+      `SELECT 1 FROM social_promos WHERE device_hash = $1 LIMIT 1`,
+      [devHash]
+    );
+    if ((existing.rowCount ?? 0) > 0) {
+      return { duplicate: true, alreadyClaimedByDevice: true };
+    }
+  }
+
   const res = await pool.query(
-    `INSERT INTO social_promos (id, platform, post_url, referral_code, city, submitted_at)
-     VALUES ($1,$2,$3,$4,$5,$6)
+    `INSERT INTO social_promos (id, platform, post_url, referral_code, city, device_hash, submitted_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7)
      ON CONFLICT (post_url) DO NOTHING
      RETURNING id`,
-    [id, input.platform, input.postUrl, input.referralCode ?? null, input.city ?? null, submittedAt]
+    [id, input.platform, input.postUrl, input.referralCode ?? null, input.city ?? null, devHash ?? null, submittedAt]
   );
 
   if (res.rowCount === 0) {
     return { duplicate: true };
+  }
+
+  if (devHash) {
+    await pool.query(
+      `INSERT INTO device_promo_claims (device_hash, kind) VALUES ($1, 'social') ON CONFLICT (device_hash) DO NOTHING`,
+      [devHash]
+    ).catch(() => {});
   }
   return { duplicate: false, record };
 }
@@ -1106,30 +1147,77 @@ export async function clearInvalidApnsToken(deviceId: string): Promise<void> {
   await pool.query(`UPDATE push_subscriptions SET apns_token = NULL WHERE device_id = $1`, [deviceId]);
 }
 
-// ─── Zero-Knowledge E2EE Two-Parent Household Vault ──────────────────────────
+// ─── Zero-Knowledge E2EE Two-Parent Household Vault (Write-Proof Protected) ──
 
-const memoryVaults = new Map<string, { ciphertext: string; updatedAt: string }>();
+const memoryVaults = new Map<string, { ciphertext: string; writeTokenHash: string; updatedAt: string }>();
 
-export async function upsertHouseholdVault(vaultId: string, ciphertext: string): Promise<{ updatedAt: string }> {
+function hashSecretToken(token: string): string {
+  return crypto.createHash("sha256").update(`bubstock-vault-write-v1:${token}`).digest("hex");
+}
+
+function safeHexEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
+export async function upsertHouseholdVault(
+  vaultId: string,
+  writeToken: string,
+  ciphertext: string
+): Promise<{ ok: boolean; forbidden?: boolean; storageFull?: boolean; updatedAt?: string }> {
+  const tokenHash = hashSecretToken(writeToken);
   const updatedAt = new Date().toISOString();
+
   if (!pool) {
-    memoryVaults.set(vaultId, { ciphertext, updatedAt });
-    return { updatedAt };
+    const existing = memoryVaults.get(vaultId);
+    if (existing && !safeHexEqual(existing.writeTokenHash, tokenHash)) {
+      return { ok: false, forbidden: true };
+    }
+    if (!existing && memoryVaults.size >= 5000) {
+      return { ok: false, storageFull: true };
+    }
+    memoryVaults.set(vaultId, { ciphertext, writeTokenHash: tokenHash, updatedAt });
+    return { ok: true, updatedAt };
   }
-  await pool.query(
-    `INSERT INTO household_vaults (vault_id, ciphertext, updated_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (vault_id) DO UPDATE
-       SET ciphertext = EXCLUDED.ciphertext,
-           updated_at = NOW()`,
-    [vaultId, ciphertext]
+
+  const existing = await pool.query(
+    `SELECT write_token_hash FROM household_vaults WHERE vault_id = $1`,
+    [vaultId]
   );
-  return { updatedAt };
+
+  if (existing.rows.length > 0) {
+    const storedHash = String(existing.rows[0].write_token_hash ?? "");
+    if (storedHash && !safeHexEqual(storedHash, tokenHash)) {
+      return { ok: false, forbidden: true };
+    }
+    await pool.query(
+      `UPDATE household_vaults
+       SET ciphertext = $2, write_token_hash = COALESCE(write_token_hash, $3), updated_at = NOW()
+       WHERE vault_id = $1`,
+      [vaultId, ciphertext, tokenHash]
+    );
+    return { ok: true, updatedAt };
+  }
+
+  // Prune abandoned vaults (>180 days untouched) & enforce storage safety ceiling
+  await pool.query(`DELETE FROM household_vaults WHERE updated_at < NOW() - INTERVAL '180 days'`).catch(() => {});
+  const cntRes = await pool.query(`SELECT COUNT(*)::INT AS cnt FROM household_vaults`);
+  if ((cntRes.rows[0]?.cnt ?? 0) >= 50_000) {
+    return { ok: false, storageFull: true };
+  }
+
+  await pool.query(
+    `INSERT INTO household_vaults (vault_id, write_token_hash, ciphertext, updated_at)
+     VALUES ($1, $2, $3, NOW())`,
+    [vaultId, tokenHash, ciphertext]
+  );
+  return { ok: true, updatedAt };
 }
 
 export async function getHouseholdVault(vaultId: string): Promise<{ ciphertext: string; updatedAt: string } | null> {
   if (!pool) {
-    return memoryVaults.get(vaultId) ?? null;
+    const v = memoryVaults.get(vaultId);
+    return v ? { ciphertext: v.ciphertext, updatedAt: v.updatedAt } : null;
   }
   const r = await pool.query(
     `SELECT ciphertext, updated_at FROM household_vaults WHERE vault_id = $1`,
@@ -1142,7 +1230,106 @@ export async function getHouseholdVault(vaultId: string): Promise<{ ciphertext: 
   };
 }
 
-// ─── Mothers' Group / Playgroup Syndicate (Viral 3-Family Loop) ──────────────
+// ─── Server-Verified Referral Codes & Entitlement Proofs ─────────────────────
+
+const memoryReferrals = new Map<string, { ownerHash: string; redeemers: Set<string> }>();
+const memoryDeviceClaims = new Set<string>();
+
+export async function registerReferralCode(code: string, deviceId: string): Promise<void> {
+  const cleanCode = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const ownerHash = hashDeviceId(deviceId);
+  if (cleanCode.length !== 6 || !ownerHash) return;
+
+  if (!pool) {
+    if (!memoryReferrals.has(cleanCode)) {
+      memoryReferrals.set(cleanCode, { ownerHash, redeemers: new Set() });
+    }
+    return;
+  }
+
+  await pool.query(
+    `INSERT INTO referral_codes (code, owner_device_hash)
+     VALUES ($1, $2)
+     ON CONFLICT (code) DO NOTHING`,
+    [cleanCode, ownerHash]
+  );
+}
+
+export async function redeemReferralCode(
+  code: string,
+  deviceId: string
+): Promise<{ accepted: boolean; status: number; message: string }> {
+  const cleanCode = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const devHash = hashDeviceId(deviceId);
+  if (cleanCode.length !== 6 || !devHash) {
+    return { accepted: false, status: 400, message: "Enter a valid 6-character invite code." };
+  }
+
+  if (!pool) {
+    const ref = memoryReferrals.get(cleanCode);
+    if (!ref) return { accepted: false, status: 404, message: "That invite code wasn't found. Ask your friend to open Bubstock once to activate their code." };
+    if (ref.ownerHash === devHash) return { accepted: false, status: 400, message: "That's your own code. Share it with a friend instead." };
+    if (memoryDeviceClaims.has(devHash)) return { accepted: false, status: 409, message: "This device has already redeemed a free preview invite." };
+    ref.redeemers.add(devHash);
+    memoryDeviceClaims.add(devHash);
+    return { accepted: true, status: 200, message: "2 months of Bubstock+ Preview unlocked!" };
+  }
+
+  const refRes = await pool.query(
+    `SELECT owner_device_hash, redeemer_hashes FROM referral_codes WHERE code = $1`,
+    [cleanCode]
+  );
+  if (refRes.rows.length === 0) {
+    return { accepted: false, status: 404, message: "That invite code wasn't found. Double-check the 6 characters with your friend." };
+  }
+  const ownerHash = String(refRes.rows[0].owner_device_hash);
+  if (ownerHash === devHash) {
+    return { accepted: false, status: 400, message: "That's your own invite code — share it with a friend instead." };
+  }
+
+  const claimRes = await pool.query(
+    `INSERT INTO device_promo_claims (device_hash, kind)
+     VALUES ($1, 'referral')
+     ON CONFLICT (device_hash) DO NOTHING
+     RETURNING device_hash`,
+    [devHash]
+  );
+  if ((claimRes.rowCount ?? 0) === 0) {
+    return { accepted: false, status: 409, message: "This device has already claimed a free preview reward." };
+  }
+
+  await pool.query(
+    `UPDATE referral_codes
+     SET redeemer_hashes = CASE
+       WHEN $2 = ANY(redeemer_hashes) THEN redeemer_hashes
+       ELSE array_append(redeemer_hashes, $2)
+     END
+     WHERE code = $1`,
+    [cleanCode, devHash]
+  );
+
+  return { accepted: true, status: 200, message: "2 months of Bubstock+ Preview unlocked! Welcome aboard." };
+}
+
+export async function hasDeviceVerifiedPromoOrReferral(deviceId: string): Promise<boolean> {
+  const devHash = hashDeviceId(deviceId);
+  if (!devHash) return false;
+  if (!pool) return memoryDeviceClaims.has(devHash);
+  try {
+    const r = await pool.query(
+      `SELECT 1 FROM device_promo_claims
+       WHERE device_hash = $1
+         AND claimed_at >= NOW() - INTERVAL '370 days'
+       LIMIT 1`,
+      [devHash]
+    );
+    return (r.rowCount ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Mothers' Group / Playgroup Syndicate (Sybil-Resistant 3-Family Loop) ────
 
 export interface MothersGroupStatus {
   groupCode: string;
@@ -1154,7 +1341,7 @@ export interface MothersGroupStatus {
   createdAt: string;
 }
 
-const memoryGroups = new Map<string, { suburb: string; city: string; members: Set<string>; createdAt: string }>();
+const memoryGroups = new Map<string, { suburb: string; city: string; members: Set<string>; ips: string[]; createdAt: string }>();
 const GROUP_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
 
 function generateGroupCode(): string {
@@ -1166,72 +1353,122 @@ function generateGroupCode(): string {
   return out;
 }
 
+function hashIp(ip?: string): string {
+  return crypto.createHash("sha256").update(`bubstock-ip-v1:${ip || "unknown"}`).digest("hex").slice(0, 16);
+}
+
 export async function createMothersGroup(
   suburb: string,
   city: string,
-  deviceId: string
+  deviceId: string,
+  clientIp?: string
 ): Promise<MothersGroupStatus> {
   const hash = hashDeviceId(deviceId) ?? crypto.randomUUID().slice(0, 16);
+  const ipHash = hashIp(clientIp);
   const code = generateGroupCode();
   const createdAt = new Date().toISOString();
 
   if (!pool) {
-    memoryGroups.set(code, { suburb, city, members: new Set([hash]), createdAt });
+    memoryGroups.set(code, { suburb, city, members: new Set([hash]), ips: [ipHash], createdAt });
     return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
   }
 
   await pool.query(
-    `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes)
-     VALUES ($1, $2, $3, $4)`,
-    [code, suburb, city, [hash]]
+    `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes, member_ip_hashes)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [code, suburb, city, [hash], [ipHash]]
   );
   return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
 }
 
 export async function joinMothersGroup(
   groupCode: string,
-  deviceId: string
-): Promise<MothersGroupStatus | null> {
+  deviceId: string,
+  clientIp?: string
+): Promise<{ status: MothersGroupStatus | null; sybilBlocked?: boolean }> {
   const cleanCode = groupCode.toUpperCase().replace(/[^A-Z0-9]/g, "");
   const hash = hashDeviceId(deviceId) ?? crypto.randomUUID().slice(0, 16);
+  const ipHash = hashIp(clientIp);
 
   if (!pool) {
     const g = memoryGroups.get(cleanCode);
-    if (!g) return null;
-    g.members.add(hash);
+    if (!g) return { status: null };
+    if (!g.members.has(hash)) {
+      const sameIpCount = g.ips.filter((x) => x === ipHash).length;
+      if (sameIpCount >= 2) return { status: null, sybilBlocked: true };
+      g.members.add(hash);
+      g.ips.push(ipHash);
+    }
     const count = g.members.size;
     return {
-      groupCode: cleanCode,
-      suburb: g.suburb,
-      city: g.city,
-      memberCount: count,
-      targetCount: 3,
-      unlocked: count >= 3,
-      createdAt: g.createdAt,
+      status: {
+        groupCode: cleanCode,
+        suburb: g.suburb,
+        city: g.city,
+        memberCount: count,
+        targetCount: 3,
+        unlocked: count >= 3,
+        createdAt: g.createdAt,
+      },
     };
   }
 
-  const res = await pool.query(
-    `UPDATE mothers_groups
-     SET member_hashes = CASE
-       WHEN $2 = ANY(member_hashes) THEN member_hashes
-       ELSE array_append(member_hashes, $2)
-     END
-     WHERE group_code = $1
-     RETURNING group_code, suburb, city, member_hashes, created_at`,
-    [cleanCode, hash]
+  const existing = await pool.query(
+    `SELECT group_code, suburb, city, member_hashes, member_ip_hashes, created_at
+     FROM mothers_groups WHERE group_code = $1`,
+    [cleanCode]
   );
-  if (res.rows.length === 0) return null;
-  const row = res.rows[0];
-  const count = Array.isArray(row.member_hashes) ? row.member_hashes.length : 1;
+  if (existing.rows.length === 0) return { status: null };
+  const row = existing.rows[0];
+  const members: string[] = Array.isArray(row.member_hashes) ? row.member_hashes : [];
+  const ipHashes: string[] = Array.isArray(row.member_ip_hashes) ? row.member_ip_hashes : [];
+
+  if (!members.includes(hash)) {
+    const sameIpCount = ipHashes.filter((x) => x === ipHash).length;
+    // Allow max 2 members from the same Wi-Fi/IP so 3 fake joins from 1 device/network cannot self-unlock
+    if (sameIpCount >= 2) {
+      return { status: null, sybilBlocked: true };
+    }
+    const res = await pool.query(
+      `UPDATE mothers_groups
+       SET member_hashes = array_append(member_hashes, $2),
+           member_ip_hashes = array_append(member_ip_hashes, $3)
+       WHERE group_code = $1
+       RETURNING group_code, suburb, city, member_hashes, created_at`,
+      [cleanCode, hash, ipHash]
+    );
+    const updated = res.rows[0];
+    const count = Array.isArray(updated.member_hashes) ? updated.member_hashes.length : 1;
+    if (count >= 3) {
+      await pool.query(
+        `INSERT INTO device_promo_claims (device_hash, kind) VALUES ($1, 'syndicate') ON CONFLICT (device_hash) DO NOTHING`,
+        [hash]
+      ).catch(() => {});
+    }
+    return {
+      status: {
+        groupCode: updated.group_code,
+        suburb: updated.suburb,
+        city: updated.city,
+        memberCount: count,
+        targetCount: 3,
+        unlocked: count >= 3,
+        createdAt: new Date(updated.created_at).toISOString(),
+      },
+    };
+  }
+
+  const count = members.length;
   return {
-    groupCode: row.group_code,
-    suburb: row.suburb,
-    city: row.city,
-    memberCount: count,
-    targetCount: 3,
-    unlocked: count >= 3,
-    createdAt: new Date(row.created_at).toISOString(),
+    status: {
+      groupCode: row.group_code,
+      suburb: row.suburb,
+      city: row.city,
+      memberCount: count,
+      targetCount: 3,
+      unlocked: count >= 3,
+      createdAt: new Date(row.created_at).toISOString(),
+    },
   };
 }
 
