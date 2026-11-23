@@ -37,6 +37,7 @@ import {
   loadFreshSpecials,
   upsertRecalls,
   loadRecalls,
+  getMedianProductPrice,
   saveSighting,
   getSightings,
   countRecentSightings,
@@ -266,7 +267,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "2.6.0",
+    version: "2.7.0",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
@@ -1033,12 +1034,14 @@ app.get("/sightings", async (req: Request, res: Response) => {
 });
 
 app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
-  const { productId, productName, storeId, storeName, suburb, retailer, state, observedPrice, note } =
+  const { productId, productName, storeId, storeName, suburb, retailer, state, observedPrice, note, deviceId } =
     req.body ?? {};
 
   const cleanProductId = sanitizeText(productId, 120);
+  const cleanProductName = sanitizeText(productName, 160);
   const cleanStoreId = sanitizeText(storeId, 120);
   const cleanStoreName = sanitizeText(storeName, 120);
+  const cleanDeviceId = sanitizeText(deviceId, 80) || undefined;
 
   if (cleanProductId.length < 2 || cleanStoreId.length < 2 || cleanStoreName.length < 2 || !VALID_STATES.has(state)) {
     res.status(400).json({
@@ -1052,9 +1055,34 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
       ? Number(observedPrice.toFixed(2))
       : undefined;
 
+  // Statistical Anti-Poisoning Guard: compare submitted shelf price against real 90-day Postgres median
+  // to block accidental typos ($1.00 formula) or malicious price poisoning while allowing real 60% clearance markdowns.
+  if (parsedPrice !== undefined && cleanProductName.length >= 3) {
+    const stats = await getMedianProductPrice(cleanProductName);
+    if (stats && stats.median >= 2.0) {
+      const minAllowed = Number(Math.max(0.5, stats.median * 0.35).toFixed(2));
+      const maxAllowed = Number((stats.median * 2.25).toFixed(2));
+      if (parsedPrice < minAllowed || parsedPrice > maxAllowed) {
+        log("warn", "rejected outlier shelf sighting price", {
+          productName: cleanProductName,
+          submitted: parsedPrice,
+          median: stats.median,
+          minAllowed,
+          maxAllowed,
+        });
+        res.status(422).json({
+          error: `Price $${parsedPrice.toFixed(2)} looks far outside the verified AU median ($${stats.median.toFixed(2)}) for this item. Please double-check the shelf tag.`,
+          rejectedAsOutlier: true,
+          expectedRange: { min: minAllowed, max: maxAllowed, median: stats.median },
+        });
+        return;
+      }
+    }
+  }
+
   const sighting = await saveSighting({
     productId: cleanProductId,
-    productName: sanitizeText(productName, 160) || undefined,
+    productName: cleanProductName || undefined,
     storeId: cleanStoreId,
     storeName: cleanStoreName,
     suburb: sanitizeText(suburb, 80) || "Melbourne",
@@ -1062,6 +1090,7 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
     state,
     observedPrice: parsedPrice,
     note: sanitizeText(note, 240) || undefined,
+    deviceId: cleanDeviceId,
   });
 
   log("info", "shelf sighting recorded", {
@@ -1069,6 +1098,7 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
     storeId: sighting.storeId,
     suburb: sighting.suburb,
     state: sighting.state,
+    corroborationCount: sighting.corroborationCount,
   });
 
   res.status(201).json({ sighting });
@@ -1449,7 +1479,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "2.6.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "2.7.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

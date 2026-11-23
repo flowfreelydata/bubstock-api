@@ -101,6 +101,8 @@ export interface ShelfSighting {
   state: StockStateValue;
   observedPrice?: number;
   note?: string;
+  corroborationCount?: number;
+  verifiedByCommunity?: boolean;
   reportedAt: string;
 }
 

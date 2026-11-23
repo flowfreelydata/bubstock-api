@@ -138,8 +138,11 @@ export async function initSchema(): Promise<void> {
         state          TEXT NOT NULL CHECK (state IN ('onShelf', 'runningLow', 'likelyGone')),
         observed_price NUMERIC(8,2),
         note           TEXT,
+        device_hash    TEXT,
         reported_at    TIMESTAMPTZ DEFAULT NOW()
       );
+
+      ALTER TABLE shelf_sightings ADD COLUMN IF NOT EXISTS device_hash TEXT;
 
       CREATE INDEX IF NOT EXISTS idx_sightings_product_store
         ON shelf_sightings(product_id, store_id, reported_at DESC);
@@ -604,7 +607,64 @@ export async function loadRecalls(): Promise<RecallRow[]> {
   }
 }
 
-// ─── Real Melbourne Shelf Sightings ──────────────────────────────────────────
+// ─── Statistical Median Reference (Anti-Poisoning Guard) ─────────────────────
+
+export async function getMedianProductPrice(
+  productName: string
+): Promise<{ median: number; sampleCount: number } | null> {
+  if (!pool) return null;
+  const clean = productName.trim().toLowerCase();
+  const tokens = clean
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((t) => t.length >= 2 && !["baby", "food", "pack", "tin", "box", "each", "from"].includes(t))
+    .slice(0, 4);
+  if (tokens.length === 0) return null;
+
+  try {
+    const tokenClauses = tokens.map(
+      (_t, i) => `(lower(product_name) LIKE '%' || $${i + 2} || '%' OR lower(matched_name) LIKE '%' || $${i + 2} || '%')`
+    );
+    const res = await pool.query(
+      `SELECT
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::FLOAT8 AS median,
+         COUNT(*)::INT AS cnt
+       FROM price_entries
+       WHERE fetched_at >= NOW() - INTERVAL '90 days'
+         AND price > 0.5
+         AND (
+           lower(product_name) = lower($1)
+           OR (${tokenClauses.join(" AND ")})
+         )`,
+      [clean, ...tokens]
+    );
+    const row = res.rows[0];
+    if (row && Number.isFinite(row.median) && row.median > 0 && row.cnt >= 1) {
+      return { median: Number(row.median.toFixed(2)), sampleCount: Number(row.cnt) };
+    }
+
+    // Fallback to live special_entries if product hasn't been searched individually yet
+    const spClauses = tokens.map((_t, i) => `lower(name) LIKE '%' || $${i + 1} || '%'`);
+    const spRes = await pool.query(
+      `SELECT
+         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY was_price)::FLOAT8 AS median,
+         COUNT(*)::INT AS cnt
+       FROM special_entries
+       WHERE ${spClauses.join(" AND ")}`,
+      tokens
+    );
+    const spRow = spRes.rows[0];
+    if (spRow && Number.isFinite(spRow.median) && spRow.median > 0 && spRow.cnt >= 1) {
+      return { median: Number(spRow.median.toFixed(2)), sampleCount: Number(spRow.cnt) };
+    }
+    return null;
+  } catch (err) {
+    console.error("[db] getMedianProductPrice error:", (err as Error).message);
+    return null;
+  }
+}
+
+// ─── Real Community Shelf Sightings & Corroboration Trust Engine ─────────────
 
 export interface NewSightingInput {
   productId: string;
@@ -616,11 +676,23 @@ export interface NewSightingInput {
   state: StockStateValue;
   observedPrice?: number;
   note?: string;
+  deviceId?: string;
 }
+
+function hashDeviceId(deviceId?: string): string | undefined {
+  if (!deviceId || deviceId.trim().length < 4) return undefined;
+  return crypto.createHash("sha256").update(`bubstock-trust-v1:${deviceId.trim()}`).digest("hex").slice(0, 16);
+}
+
+interface InternalMemorySighting extends ShelfSighting {
+  deviceHash?: string;
+}
+const memorySightingsWithHash: InternalMemorySighting[] = memorySightings;
 
 export async function saveSighting(input: NewSightingInput): Promise<ShelfSighting> {
   const id = crypto.randomUUID();
   const reportedAt = new Date().toISOString();
+  const deviceHash = hashDeviceId(input.deviceId);
   const sighting: ShelfSighting = {
     id,
     productId: input.productId,
@@ -632,19 +704,35 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
     state: input.state,
     observedPrice: input.observedPrice,
     note: input.note,
+    corroborationCount: 1,
+    verifiedByCommunity: false,
     reportedAt,
   };
 
   if (!pool) {
-    memorySightings.unshift(sighting);
-    if (memorySightings.length > 1000) memorySightings.pop();
+    memorySightingsWithHash.unshift({ ...sighting, deviceHash });
+    if (memorySightingsWithHash.length > 1000) memorySightingsWithHash.pop();
+    const cutoff = Date.now() - 12 * 3600 * 1000;
+    const reporters = new Set(
+      memorySightingsWithHash
+        .filter(
+          (s) =>
+            s.productId === sighting.productId &&
+            s.storeId === sighting.storeId &&
+            s.state === sighting.state &&
+            new Date(s.reportedAt).getTime() >= cutoff
+        )
+        .map((s) => s.deviceHash ?? s.id)
+    );
+    sighting.corroborationCount = Math.max(1, reporters.size);
+    sighting.verifiedByCommunity = sighting.corroborationCount >= 2;
     return sighting;
   }
 
   await pool.query(
     `INSERT INTO shelf_sightings
-       (id, product_id, product_name, store_id, store_name, suburb, retailer, state, observed_price, note, reported_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+       (id, product_id, product_name, store_id, store_name, suburb, retailer, state, observed_price, note, device_hash, reported_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
     [
       sighting.id,
       sighting.productId,
@@ -656,9 +744,24 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
       sighting.state,
       sighting.observedPrice ?? null,
       sighting.note ?? null,
+      deviceHash ?? null,
       sighting.reportedAt,
     ]
   );
+
+  // Count distinct local parents agreeing on this product/store/state within the last 12 hours
+  const corr = await pool.query(
+    `SELECT COUNT(DISTINCT COALESCE(device_hash, id))::INT AS cnt
+     FROM shelf_sightings
+     WHERE product_id = $1
+       AND store_id = $2
+       AND state = $3
+       AND reported_at >= NOW() - INTERVAL '12 hours'`,
+    [sighting.productId, sighting.storeId, sighting.state]
+  );
+  const count = Math.max(1, Number(corr.rows[0]?.cnt ?? 1));
+  sighting.corroborationCount = count;
+  sighting.verifiedByCommunity = count >= 2;
 
   return sighting;
 }
@@ -674,11 +777,41 @@ export async function getSightings(opts: {
 
   if (!pool) {
     const cutoff = Date.now() - hours * 3600 * 1000;
-    return memorySightings
+    const corrCutoff = Date.now() - 12 * 3600 * 1000;
+    const filtered = memorySightingsWithHash
       .filter((s) => new Date(s.reportedAt).getTime() >= cutoff)
       .filter((s) => !opts.productId || s.productId === opts.productId)
       .filter((s) => !opts.storeId || s.storeId === opts.storeId)
       .slice(0, limit);
+
+    const groups = new Map<string, Set<string>>();
+    for (const s of filtered) {
+      if (new Date(s.reportedAt).getTime() >= corrCutoff) {
+        const k = `${s.productId}|${s.storeId}|${s.state}`;
+        const set = groups.get(k) ?? new Set<string>();
+        set.add(s.deviceHash ?? s.id);
+        groups.set(k, set);
+      }
+    }
+    return filtered.map((s) => {
+      const k = `${s.productId}|${s.storeId}|${s.state}`;
+      const count = Math.max(1, groups.get(k)?.size ?? 1);
+      return {
+        id: s.id,
+        productId: s.productId,
+        productName: s.productName,
+        storeId: s.storeId,
+        storeName: s.storeName,
+        suburb: s.suburb,
+        retailer: s.retailer,
+        state: s.state,
+        observedPrice: s.observedPrice,
+        note: s.note,
+        corroborationCount: count,
+        verifiedByCommunity: count >= 2,
+        reportedAt: s.reportedAt,
+      };
+    });
   }
 
   const conditions = [`reported_at >= NOW() - ($1 || ' hours')::INTERVAL`];
@@ -696,7 +829,7 @@ export async function getSightings(opts: {
 
   const result = await pool.query(
     `SELECT id, product_id, product_name, store_id, store_name, suburb, retailer,
-            state, observed_price::FLOAT8 AS observed_price, note, reported_at
+            state, observed_price::FLOAT8 AS observed_price, note, device_hash, reported_at
      FROM shelf_sightings
      WHERE ${conditions.join(" AND ")}
      ORDER BY reported_at DESC
@@ -704,19 +837,38 @@ export async function getSightings(opts: {
     params
   );
 
-  return result.rows.map((r) => ({
-    id: r.id,
-    productId: r.product_id,
-    productName: r.product_name ?? undefined,
-    storeId: r.store_id,
-    storeName: r.store_name,
-    suburb: r.suburb,
-    retailer: r.retailer,
-    state: r.state as StockStateValue,
-    observedPrice: r.observed_price ?? undefined,
-    note: r.note ?? undefined,
-    reportedAt: new Date(r.reported_at).toISOString(),
-  }));
+  // Compute real distinct-parent corroboration within the last 12 hours
+  const corrCutoffMs = Date.now() - 12 * 3600 * 1000;
+  const groups = new Map<string, Set<string>>();
+  for (const r of result.rows) {
+    const ts = new Date(r.reported_at).getTime();
+    if (ts >= corrCutoffMs) {
+      const k = `${r.product_id}|${r.store_id}|${r.state}`;
+      const set = groups.get(k) ?? new Set<string>();
+      set.add(r.device_hash ?? r.id);
+      groups.set(k, set);
+    }
+  }
+
+  return result.rows.map((r) => {
+    const k = `${r.product_id}|${r.store_id}|${r.state}`;
+    const count = Math.max(1, groups.get(k)?.size ?? 1);
+    return {
+      id: r.id,
+      productId: r.product_id,
+      productName: r.product_name ?? undefined,
+      storeId: r.store_id,
+      storeName: r.store_name,
+      suburb: r.suburb,
+      retailer: r.retailer,
+      state: r.state as StockStateValue,
+      observedPrice: r.observed_price ?? undefined,
+      note: r.note ?? undefined,
+      corroborationCount: count,
+      verifiedByCommunity: count >= 2,
+      reportedAt: new Date(r.reported_at).toISOString(),
+    };
+  });
 }
 
 export async function countRecentSightings(hours = 24): Promise<number> {
