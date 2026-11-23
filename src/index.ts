@@ -48,11 +48,26 @@ import {
   listActiveApnsSubscriptions,
   markPushAlertSentIfNew,
   clearInvalidApnsToken,
+  upsertHouseholdVault,
+  getHouseholdVault,
+  createMothersGroup,
+  joinMothersGroup,
+  getMothersGroup,
+  getSuburbShortages,
+  detectShrinkflation,
+  getCategoryMedians,
   pingDB,
   type PushSubscriptionRecord,
   type RecallRow,
   type WatchedAlertRule,
 } from "./db.js";
+import {
+  renderCostIndexPage,
+  renderHalfPriceDealsPage,
+  renderProductCityPricePage,
+  renderSitemapXml,
+  type BabyCostIndexData,
+} from "./seo.js";
 import { isApnsConfigured, sendApnsPush } from "./push.js";
 import {
   areComparablePair,
@@ -267,7 +282,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "2.7.0",
+    version: "2.8.0",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
@@ -286,6 +301,16 @@ app.get("/", (_req, res) => {
       "/recalls?state=VIC|NSW|QLD|WA|SA|TAS",
       "/recalls/check",
       "/sightings",
+      "/shortages",
+      "/shrinkflation",
+      "/index/au",
+      "/household/sync",
+      "/groups/create",
+      "/groups/join",
+      "/au/half-price-baby-deals",
+      "/au/prices/:city/:slug",
+      "/au/index",
+      "/sitemap.xml",
     ],
   });
 });
@@ -1427,6 +1452,192 @@ async function handlePulse(req: Request, res: Response) {
 app.get("/pulse", handlePulse);
 app.get("/melbourne/pulse", handlePulse);
 
+// ─── Zero-Knowledge E2EE Two-Parent Household Sync ───────────────────────────
+
+app.post("/household/sync", sightingLimit, async (req: Request, res: Response) => {
+  const vaultId = typeof req.body?.vaultId === "string" ? req.body.vaultId.trim().toLowerCase() : "";
+  const ciphertext = typeof req.body?.ciphertext === "string" ? req.body.ciphertext.trim() : "";
+
+  if (!/^[a-f0-9]{32,64}$/.test(vaultId)) {
+    res.status(400).json({ error: "Invalid vaultId (must be 32-64 hex chars)" });
+    return;
+  }
+  if (ciphertext.length < 16 || ciphertext.length > 65_536) {
+    res.status(400).json({ error: "Invalid encrypted payload size" });
+    return;
+  }
+
+  const saved = await upsertHouseholdVault(vaultId, ciphertext);
+  res.status(200).json({ synced: true, updatedAt: saved.updatedAt });
+});
+
+app.get("/household/sync/:vaultId", async (req: Request, res: Response) => {
+  const vaultId = String(req.params.vaultId ?? "").trim().toLowerCase();
+  if (!/^[a-f0-9]{32,64}$/.test(vaultId)) {
+    res.status(400).json({ error: "Invalid vaultId" });
+    return;
+  }
+  const vault = await getHouseholdVault(vaultId);
+  if (!vault) {
+    res.status(404).json({ error: "Household vault not found yet" });
+    return;
+  }
+  res.json(vault);
+});
+
+// ─── Mothers' Group / Playgroup Syndicate (Viral 3-Family Loop) ──────────────
+
+app.post("/groups/create", sightingLimit, async (req: Request, res: Response) => {
+  const suburb = sanitizeText(req.body?.suburb, 60) || "Melbourne";
+  const city = sanitizeText(req.body?.city, 40) || "Melbourne";
+  const deviceId = sanitizeText(req.body?.deviceId, 80);
+  if (deviceId.length < 6) {
+    res.status(400).json({ error: "deviceId required" });
+    return;
+  }
+  const status = await createMothersGroup(suburb, city, deviceId);
+  res.status(201).json(status);
+});
+
+app.post("/groups/join", sightingLimit, async (req: Request, res: Response) => {
+  const groupCode = sanitizeText(req.body?.groupCode, 16);
+  const deviceId = sanitizeText(req.body?.deviceId, 80);
+  if (groupCode.length < 4 || deviceId.length < 6) {
+    res.status(400).json({ error: "Valid groupCode and deviceId required" });
+    return;
+  }
+  const status = await joinMothersGroup(groupCode, deviceId);
+  if (!status) {
+    res.status(404).json({ error: "Mothers' Group code not found. Double-check the 6-character code." });
+    return;
+  }
+  res.json(status);
+});
+
+app.get("/groups/:code", async (req: Request, res: Response) => {
+  const status = await getMothersGroup(String(req.params.code ?? ""));
+  if (!status) {
+    res.status(404).json({ error: "Group not found" });
+    return;
+  }
+  res.json(status);
+});
+
+// ─── Real-Time Suburb Shortage Heatmap & 90-Day Shrinkflation Detector ───────
+
+app.get("/shortages", async (req: Request, res: Response) => {
+  const hours = Number(req.query.hours ?? 24) || 24;
+  const shortages = await getSuburbShortages(hours);
+  res.setHeader("Cache-Control", "public, max-age=120, s-maxage=120");
+  res.json({
+    count: shortages.length,
+    shortages,
+    fetchedAt: new Date().toISOString(),
+  });
+});
+
+app.get("/shrinkflation", async (req: Request, res: Response) => {
+  const product = typeof req.query.product === "string" ? sanitizeText(req.query.product, 120) : undefined;
+  const alerts = await detectShrinkflation(product);
+  res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600");
+  res.json({
+    count: alerts.length,
+    alerts,
+    fetchedAt: new Date().toISOString(),
+  });
+});
+
+// ─── Australian Baby Cost-of-Living Index (JSON + Press SSR HTML) & SEO Pages
+
+async function buildCostIndexData(): Promise<{
+  index: BabyCostIndexData;
+  gaps: Awaited<ReturnType<typeof getColesVsWoolworthsGaps>>;
+  recalls: RecallEntry[];
+}> {
+  const [specials, gaps, { recalls }, sightings24h, shrinkAlerts, medians] = await Promise.all([
+    loadLiveSpecials(),
+    singleflight("compare:gaps", () => getColesVsWoolworthsGaps(72)),
+    getRecallsList(),
+    countRecentSightings(24),
+    detectShrinkflation(),
+    getCategoryMedians(),
+  ]);
+
+  const halfPrice = specials.filter((s) => s.savingsPercent >= 40).length;
+  const nonZeroGaps = gaps.filter((g) => g.savingsAmount >= 0.1);
+  const avgGap =
+    nonZeroGaps.length > 0
+      ? Number((nonZeroGaps.reduce((acc, g) => acc + g.savingsAmount, 0) / nonZeroGaps.length).toFixed(2))
+      : 0;
+  const biggestGap = nonZeroGaps[0]?.savingsAmount ?? 0;
+
+  return {
+    index: {
+      generatedAt: new Date().toISOString(),
+      region: "Australia (VIC, NSW, QLD, WA, SA, TAS)",
+      liveSpecialsCount: specials.length,
+      halfPriceDealsCount: halfPrice,
+      averageColesVsWooliesGapAUD: avgGap,
+      biggestGapAUD: biggestGap,
+      medianFormulaPriceAUD: medians.formula,
+      medianNappiesPriceAUD: medians.nappies,
+      activeRecallsCount: recalls.length,
+      shrinkflationAlertsCount: shrinkAlerts.length,
+      sightingsLast24h: sightings24h,
+    },
+    gaps,
+    recalls,
+  };
+}
+
+app.get("/index/au", async (_req: Request, res: Response) => {
+  const { index } = await buildCostIndexData();
+  res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
+  res.json(index);
+});
+
+app.get("/au/index", async (_req: Request, res: Response) => {
+  const { index, gaps, recalls } = await buildCostIndexData();
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
+  res.send(renderCostIndexPage(index, gaps, recalls));
+});
+
+app.get("/au/half-price-baby-deals", async (_req: Request, res: Response) => {
+  const specials = await loadLiveSpecials();
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
+  res.send(renderHalfPriceDealsPage(specials, new Date().toISOString()));
+});
+
+app.get("/au/prices/:city/:slug", priceLimit, async (req: Request, res: Response) => {
+  const rawCity = String(req.params.city ?? "melbourne").toLowerCase() as AuCity;
+  const ctx = CITY_CONTEXTS[rawCity] ?? CITY_CONTEXTS.melbourne;
+  const rawSlug = sanitizeText(req.params.slug, 100).toLowerCase();
+  const productQuery = rawSlug.replace(/[^a-z0-9]+/g, " ").trim();
+  if (productQuery.length < 2) {
+    res.status(400).send("Invalid product slug");
+    return;
+  }
+  const result = await resolveMultiRetailerPrices(productQuery, ctx.defaultSuburb, ctx.state);
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600");
+  res.send(renderProductCityPricePage(ctx.regionLabel, ctx.city, rawSlug, result));
+});
+
+app.get("/sitemap.xml", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "application/xml; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(renderSitemapXml(ALL_CITIES));
+});
+
+app.get("/robots.txt", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.send(
+    "User-agent: *\nAllow: /au/\nAllow: /sitemap.xml\nSitemap: https://bubstock-api-production.up.railway.app/sitemap.xml\n"
+  );
+});
+
 // ─── Error middleware ─────────────────────────────────────────────────────────
 
 app.use((err: Error, req: Request, res: Response, _next: NextFunction) => {
@@ -1479,7 +1690,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "2.7.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "2.8.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

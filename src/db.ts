@@ -184,6 +184,20 @@ export async function initSchema(): Promise<void> {
 
       CREATE INDEX IF NOT EXISTS idx_sent_push_recent
         ON sent_push_alerts(sent_at DESC);
+
+      CREATE TABLE IF NOT EXISTS household_vaults (
+        vault_id    TEXT PRIMARY KEY,
+        ciphertext  TEXT NOT NULL,
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS mothers_groups (
+        group_code    TEXT PRIMARY KEY,
+        suburb        TEXT NOT NULL,
+        city          TEXT NOT NULL,
+        member_hashes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
     console.log("[db] schema ready");
   } finally {
@@ -1090,4 +1104,377 @@ export async function clearInvalidApnsToken(deviceId: string): Promise<void> {
     return;
   }
   await pool.query(`UPDATE push_subscriptions SET apns_token = NULL WHERE device_id = $1`, [deviceId]);
+}
+
+// ─── Zero-Knowledge E2EE Two-Parent Household Vault ──────────────────────────
+
+const memoryVaults = new Map<string, { ciphertext: string; updatedAt: string }>();
+
+export async function upsertHouseholdVault(vaultId: string, ciphertext: string): Promise<{ updatedAt: string }> {
+  const updatedAt = new Date().toISOString();
+  if (!pool) {
+    memoryVaults.set(vaultId, { ciphertext, updatedAt });
+    return { updatedAt };
+  }
+  await pool.query(
+    `INSERT INTO household_vaults (vault_id, ciphertext, updated_at)
+     VALUES ($1, $2, NOW())
+     ON CONFLICT (vault_id) DO UPDATE
+       SET ciphertext = EXCLUDED.ciphertext,
+           updated_at = NOW()`,
+    [vaultId, ciphertext]
+  );
+  return { updatedAt };
+}
+
+export async function getHouseholdVault(vaultId: string): Promise<{ ciphertext: string; updatedAt: string } | null> {
+  if (!pool) {
+    return memoryVaults.get(vaultId) ?? null;
+  }
+  const r = await pool.query(
+    `SELECT ciphertext, updated_at FROM household_vaults WHERE vault_id = $1`,
+    [vaultId]
+  );
+  if (r.rows.length === 0) return null;
+  return {
+    ciphertext: String(r.rows[0].ciphertext),
+    updatedAt: new Date(r.rows[0].updated_at).toISOString(),
+  };
+}
+
+// ─── Mothers' Group / Playgroup Syndicate (Viral 3-Family Loop) ──────────────
+
+export interface MothersGroupStatus {
+  groupCode: string;
+  suburb: string;
+  city: string;
+  memberCount: number;
+  targetCount: number;
+  unlocked: boolean;
+  createdAt: string;
+}
+
+const memoryGroups = new Map<string, { suburb: string; city: string; members: Set<string>; createdAt: string }>();
+const GROUP_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
+
+function generateGroupCode(): string {
+  const bytes = crypto.randomBytes(6);
+  let out = "MG";
+  for (let i = 0; i < 4; i++) {
+    out += GROUP_ALPHABET[bytes[i] % GROUP_ALPHABET.length];
+  }
+  return out;
+}
+
+export async function createMothersGroup(
+  suburb: string,
+  city: string,
+  deviceId: string
+): Promise<MothersGroupStatus> {
+  const hash = hashDeviceId(deviceId) ?? crypto.randomUUID().slice(0, 16);
+  const code = generateGroupCode();
+  const createdAt = new Date().toISOString();
+
+  if (!pool) {
+    memoryGroups.set(code, { suburb, city, members: new Set([hash]), createdAt });
+    return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
+  }
+
+  await pool.query(
+    `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes)
+     VALUES ($1, $2, $3, $4)`,
+    [code, suburb, city, [hash]]
+  );
+  return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
+}
+
+export async function joinMothersGroup(
+  groupCode: string,
+  deviceId: string
+): Promise<MothersGroupStatus | null> {
+  const cleanCode = groupCode.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const hash = hashDeviceId(deviceId) ?? crypto.randomUUID().slice(0, 16);
+
+  if (!pool) {
+    const g = memoryGroups.get(cleanCode);
+    if (!g) return null;
+    g.members.add(hash);
+    const count = g.members.size;
+    return {
+      groupCode: cleanCode,
+      suburb: g.suburb,
+      city: g.city,
+      memberCount: count,
+      targetCount: 3,
+      unlocked: count >= 3,
+      createdAt: g.createdAt,
+    };
+  }
+
+  const res = await pool.query(
+    `UPDATE mothers_groups
+     SET member_hashes = CASE
+       WHEN $2 = ANY(member_hashes) THEN member_hashes
+       ELSE array_append(member_hashes, $2)
+     END
+     WHERE group_code = $1
+     RETURNING group_code, suburb, city, member_hashes, created_at`,
+    [cleanCode, hash]
+  );
+  if (res.rows.length === 0) return null;
+  const row = res.rows[0];
+  const count = Array.isArray(row.member_hashes) ? row.member_hashes.length : 1;
+  return {
+    groupCode: row.group_code,
+    suburb: row.suburb,
+    city: row.city,
+    memberCount: count,
+    targetCount: 3,
+    unlocked: count >= 3,
+    createdAt: new Date(row.created_at).toISOString(),
+  };
+}
+
+export async function getMothersGroup(groupCode: string): Promise<MothersGroupStatus | null> {
+  const cleanCode = groupCode.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!pool) {
+    const g = memoryGroups.get(cleanCode);
+    if (!g) return null;
+    const count = g.members.size;
+    return {
+      groupCode: cleanCode,
+      suburb: g.suburb,
+      city: g.city,
+      memberCount: count,
+      targetCount: 3,
+      unlocked: count >= 3,
+      createdAt: g.createdAt,
+    };
+  }
+  const r = await pool.query(
+    `SELECT group_code, suburb, city, member_hashes, created_at FROM mothers_groups WHERE group_code = $1`,
+    [cleanCode]
+  );
+  if (r.rows.length === 0) return null;
+  const row = r.rows[0];
+  const count = Array.isArray(row.member_hashes) ? row.member_hashes.length : 0;
+  return {
+    groupCode: row.group_code,
+    suburb: row.suburb,
+    city: row.city,
+    memberCount: count,
+    targetCount: 3,
+    unlocked: count >= 3,
+    createdAt: new Date(row.created_at).toISOString(),
+  };
+}
+
+// ─── Suburb-Level Formula & Essential Shortage Heatmap ───────────────────────
+
+export interface SuburbShortageItem {
+  id: string;
+  productId: string;
+  productName: string;
+  suburb: string;
+  retailer: string;
+  outCount: number;
+  lowCount: number;
+  reporterCount: number;
+  severity: "high" | "watch";
+  lastReportedAt: string;
+}
+
+export async function getSuburbShortages(hours = 24): Promise<SuburbShortageItem[]> {
+  const windowHrs = Math.min(Math.max(hours, 4), 72);
+  if (!pool) return [];
+  try {
+    const res = await pool.query(
+      `SELECT
+         product_id,
+         COALESCE(MAX(product_name), product_id) AS product_name,
+         suburb,
+         retailer,
+         COUNT(*) FILTER (WHERE state = 'likelyGone')::INT AS out_cnt,
+         COUNT(*) FILTER (WHERE state = 'runningLow')::INT AS low_cnt,
+         COUNT(DISTINCT COALESCE(device_hash, id))::INT AS reporters,
+         MAX(reported_at) AS last_reported
+       FROM shelf_sightings
+       WHERE reported_at >= NOW() - ($1 || ' hours')::INTERVAL
+         AND state IN ('likelyGone', 'runningLow')
+       GROUP BY product_id, suburb, retailer
+       ORDER BY out_cnt DESC, reporters DESC, last_reported DESC
+       LIMIT 30`,
+      [windowHrs]
+    );
+    return res.rows.map((r) => ({
+      id: `${r.product_id}|${r.suburb}|${r.retailer}`,
+      productId: String(r.product_id),
+      productName: String(r.product_name),
+      suburb: String(r.suburb),
+      retailer: String(r.retailer),
+      outCount: Number(r.out_cnt),
+      lowCount: Number(r.low_cnt),
+      reporterCount: Number(r.reporters),
+      severity: Number(r.out_cnt) >= 2 ? "high" : "watch",
+      lastReportedAt: new Date(r.last_reported).toISOString(),
+    }));
+  } catch (err) {
+    console.error("[db] getSuburbShortages error:", (err as Error).message);
+    return [];
+  }
+}
+
+// ─── 90-Day Unit-Price & Pack-Size Shrinkflation Detector ────────────────────
+
+export interface ShrinkflationAlert {
+  id: string;
+  productName: string;
+  retailer: string;
+  oldUnit: string;
+  newUnit: string;
+  oldPrice: number;
+  newPrice: number;
+  unitPriceJumpPercent: number;
+  packShrinkDescription: string;
+  firstObservedAt: string;
+  latestObservedAt: string;
+}
+
+function parseUnitDollars(unit: string): number | null {
+  const m = unit.match(/\$\s*(\d+(?:\.\d{1,3})?)/);
+  if (!m) return null;
+  const v = Number(m[1]);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+function parsePackMeasure(text: string): { qty: number; kind: string } | null {
+  const m = text.match(/\b(\d{2,4})\s*(pack|pk|nappies|wipes|g|ml)\b/i);
+  if (!m) return null;
+  const qty = Number(m[1]);
+  if (!Number.isFinite(qty) || qty < 10) return null;
+  const rawKind = m[2].toLowerCase();
+  const kind = rawKind === "pk" || rawKind === "nappies" || rawKind === "wipes" ? "pack" : rawKind;
+  return { qty, kind };
+}
+
+export async function detectShrinkflation(productFilter?: string): Promise<ShrinkflationAlert[]> {
+  if (!pool) return [];
+  try {
+    const params: string[] = [];
+    let filterSql = "";
+    if (productFilter && productFilter.trim().length >= 3) {
+      params.push(productFilter.trim().toLowerCase());
+      filterSql = `AND (lower(product_name) LIKE '%' || $1 || '%' OR lower(matched_name) LIKE '%' || $1 || '%')`;
+    }
+
+    const res = await pool.query(
+      `WITH ranked AS (
+         SELECT
+           lower(product_name) AS pkey,
+           retailer,
+           matched_name,
+           price::FLOAT8 AS price,
+           COALESCE(unit, '') AS unit,
+           fetched_at,
+           ROW_NUMBER() OVER (PARTITION BY lower(product_name), retailer ORDER BY fetched_at ASC) AS rn_first,
+           ROW_NUMBER() OVER (PARTITION BY lower(product_name), retailer ORDER BY fetched_at DESC) AS rn_last
+         FROM price_entries
+         WHERE fetched_at >= NOW() - INTERVAL '90 days'
+           AND price > 0.5
+           ${filterSql}
+       )
+       SELECT
+         a.pkey,
+         a.retailer,
+         a.matched_name AS old_name,
+         b.matched_name AS new_name,
+         a.price AS old_price,
+         b.price AS new_price,
+         a.unit AS old_unit,
+         b.unit AS new_unit,
+         a.fetched_at AS first_at,
+         b.fetched_at AS last_at
+       FROM ranked a
+       JOIN ranked b
+         ON a.pkey = b.pkey AND a.retailer = b.retailer
+       WHERE a.rn_first = 1 AND b.rn_last = 1
+         AND b.fetched_at >= a.fetched_at + INTERVAL '5 days'
+       LIMIT 200`,
+      params
+    );
+
+    const alerts: ShrinkflationAlert[] = [];
+    for (const r of res.rows) {
+      const oldU = parseUnitDollars(String(r.old_unit));
+      const newU = parseUnitDollars(String(r.new_unit));
+      const oldMeasure = parsePackMeasure(String(r.old_name ?? ""));
+      const newMeasure = parsePackMeasure(String(r.new_name ?? ""));
+
+      let jumpPct = 0;
+      let desc = "";
+
+      if (oldMeasure && newMeasure && oldMeasure.kind === newMeasure.kind && newMeasure.qty < oldMeasure.qty) {
+        const oldPerUnit = Number(r.old_price) / oldMeasure.qty;
+        const newPerUnit = Number(r.new_price) / newMeasure.qty;
+        jumpPct = Math.round(((newPerUnit - oldPerUnit) / oldPerUnit) * 100);
+        if (jumpPct >= 6) {
+          desc = `Pack shrank from ${oldMeasure.qty}${oldMeasure.kind} to ${newMeasure.qty}${newMeasure.kind} (+${jumpPct}% real unit cost)`;
+        }
+      } else if (oldU && newU && newU > oldU * 1.08 && Number(r.new_price) >= Number(r.old_price) * 0.98) {
+        jumpPct = Math.round(((newU - oldU) / oldU) * 100);
+        desc = `Unit price rose +${jumpPct}% (${r.old_unit} → ${r.new_unit})`;
+      }
+
+      if (jumpPct >= 6 && desc) {
+        alerts.push({
+          id: `${r.retailer}|${r.pkey}`,
+          productName: String(r.new_name || r.pkey),
+          retailer: String(r.retailer),
+          oldUnit: String(r.old_unit),
+          newUnit: String(r.new_unit),
+          oldPrice: Number(r.old_price),
+          newPrice: Number(r.new_price),
+          unitPriceJumpPercent: jumpPct,
+          packShrinkDescription: desc,
+          firstObservedAt: new Date(r.first_at).toISOString(),
+          latestObservedAt: new Date(r.last_at).toISOString(),
+        });
+      }
+    }
+
+    return alerts.sort((a, b) => b.unitPriceJumpPercent - a.unitPriceJumpPercent).slice(0, 25);
+  } catch (err) {
+    console.error("[db] detectShrinkflation error:", (err as Error).message);
+    return [];
+  }
+}
+
+export async function getCategoryMedians(): Promise<{ formula: number | null; nappies: number | null }> {
+  if (!pool) return { formula: null, nappies: null };
+  try {
+    const [fRes, nRes] = await Promise.all([
+      pool.query(
+        `SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::FLOAT8 AS med
+         FROM price_entries
+         WHERE fetched_at >= NOW() - INTERVAL '30 days'
+           AND (lower(product_name) LIKE '%formula%' OR lower(matched_name) LIKE '%formula%' OR lower(product_name) LIKE '%aptamil%' OR lower(product_name) LIKE '%karicare%')
+           AND price >= 12`
+      ),
+      pool.query(
+        `SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::FLOAT8 AS med
+         FROM price_entries
+         WHERE fetched_at >= NOW() - INTERVAL '30 days'
+           AND (lower(product_name) LIKE '%napp%' OR lower(matched_name) LIKE '%napp%' OR lower(product_name) LIKE '%huggies%' OR lower(product_name) LIKE '%babylove%')
+           AND price >= 8`
+      ),
+    ]);
+    const fm = fRes.rows[0]?.med;
+    const nm = nRes.rows[0]?.med;
+    return {
+      formula: Number.isFinite(fm) && fm > 0 ? Number(fm.toFixed(2)) : null,
+      nappies: Number.isFinite(nm) && nm > 0 ? Number(nm.toFixed(2)) : null,
+    };
+  } catch {
+    return { formula: null, nappies: null };
+  }
 }
