@@ -158,6 +158,29 @@ export async function initSchema(): Promise<void> {
 
       CREATE INDEX IF NOT EXISTS idx_social_promos_recent
         ON social_promos(submitted_at DESC);
+
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        device_id            TEXT PRIMARY KEY,
+        apns_token           TEXT,
+        city                 TEXT NOT NULL DEFAULT 'melbourne',
+        state                TEXT NOT NULL DEFAULT 'VIC',
+        has_plus             BOOLEAN NOT NULL DEFAULT FALSE,
+        half_price_enabled   BOOLEAN NOT NULL DEFAULT FALSE,
+        min_discount_percent INT NOT NULL DEFAULT 40,
+        alert_categories     TEXT[] NOT NULL DEFAULT ARRAY['nappies','formula'],
+        watched_rules        JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at           TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS sent_push_alerts (
+        device_id  TEXT NOT NULL,
+        alert_key  TEXT NOT NULL,
+        sent_at    TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (device_id, alert_key)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sent_push_recent
+        ON sent_push_alerts(sent_at DESC);
     `);
     console.log("[db] schema ready");
   } finally {
@@ -779,4 +802,140 @@ export async function getRecentSocialPromos(limit = 50): Promise<SocialPromoReco
   } catch {
     return [];
   }
+}
+
+// ─── Push Notification Alert Subscriptions (APNs + Background Check) ─────────
+
+export interface WatchedAlertRule {
+  productId: string;
+  name: string;
+  targetPrice?: number;
+}
+
+export interface PushSubscriptionRecord {
+  deviceId: string;
+  apnsToken?: string;
+  city: string;
+  state: string;
+  hasPlus: boolean;
+  halfPriceEnabled: boolean;
+  minDiscountPercent: number;
+  alertCategories: string[];
+  watchedRules: WatchedAlertRule[];
+  updatedAt: string;
+}
+
+const memoryPushSubs = new Map<string, PushSubscriptionRecord>();
+const memorySentKeys = new Set<string>();
+
+export async function upsertPushSubscription(sub: Omit<PushSubscriptionRecord, "updatedAt">): Promise<void> {
+  const updatedAt = new Date().toISOString();
+  const full: PushSubscriptionRecord = { ...sub, updatedAt };
+
+  if (!pool) {
+    memoryPushSubs.set(sub.deviceId, full);
+    return;
+  }
+
+  await pool.query(
+    `INSERT INTO push_subscriptions
+       (device_id, apns_token, city, state, has_plus, half_price_enabled, min_discount_percent, alert_categories, watched_rules, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+     ON CONFLICT (device_id) DO UPDATE SET
+       apns_token           = COALESCE(EXCLUDED.apns_token, push_subscriptions.apns_token),
+       city                 = EXCLUDED.city,
+       state                = EXCLUDED.state,
+       has_plus             = EXCLUDED.has_plus,
+       half_price_enabled   = EXCLUDED.half_price_enabled,
+       min_discount_percent = EXCLUDED.min_discount_percent,
+       alert_categories     = EXCLUDED.alert_categories,
+       watched_rules        = EXCLUDED.watched_rules,
+       updated_at           = EXCLUDED.updated_at`,
+    [
+      sub.deviceId,
+      sub.apnsToken ?? null,
+      sub.city,
+      sub.state,
+      sub.hasPlus,
+      sub.halfPriceEnabled,
+      sub.minDiscountPercent,
+      sub.alertCategories,
+      JSON.stringify(sub.watchedRules),
+      updatedAt,
+    ]
+  );
+}
+
+export async function getPushSubscription(deviceId: string): Promise<PushSubscriptionRecord | null> {
+  if (!pool) return memoryPushSubs.get(deviceId) ?? null;
+  const r = await pool.query(
+    `SELECT device_id, apns_token, city, state, has_plus, half_price_enabled,
+            min_discount_percent, alert_categories, watched_rules, updated_at
+     FROM push_subscriptions WHERE device_id = $1`,
+    [deviceId]
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+  return {
+    deviceId: row.device_id,
+    apnsToken: row.apns_token ?? undefined,
+    city: row.city,
+    state: row.state,
+    hasPlus: Boolean(row.has_plus),
+    halfPriceEnabled: Boolean(row.half_price_enabled),
+    minDiscountPercent: Number(row.min_discount_percent ?? 40),
+    alertCategories: Array.isArray(row.alert_categories) ? row.alert_categories : ["nappies", "formula"],
+    watchedRules: Array.isArray(row.watched_rules) ? row.watched_rules : [],
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+export async function listActiveApnsSubscriptions(): Promise<PushSubscriptionRecord[]> {
+  if (!pool) {
+    return [...memoryPushSubs.values()].filter((s) => Boolean(s.apnsToken));
+  }
+  const r = await pool.query(
+    `SELECT device_id, apns_token, city, state, has_plus, half_price_enabled,
+            min_discount_percent, alert_categories, watched_rules, updated_at
+     FROM push_subscriptions
+     WHERE apns_token IS NOT NULL AND length(apns_token) >= 32`
+  );
+  return r.rows.map((row) => ({
+    deviceId: row.device_id,
+    apnsToken: row.apns_token ?? undefined,
+    city: row.city,
+    state: row.state,
+    hasPlus: Boolean(row.has_plus),
+    halfPriceEnabled: Boolean(row.half_price_enabled),
+    minDiscountPercent: Number(row.min_discount_percent ?? 40),
+    alertCategories: Array.isArray(row.alert_categories) ? row.alert_categories : ["nappies", "formula"],
+    watchedRules: Array.isArray(row.watched_rules) ? row.watched_rules : [],
+    updatedAt: new Date(row.updated_at).toISOString(),
+  }));
+}
+
+export async function markPushAlertSentIfNew(deviceId: string, alertKey: string): Promise<boolean> {
+  if (!pool) {
+    const k = `${deviceId}|${alertKey}`;
+    if (memorySentKeys.has(k)) return false;
+    memorySentKeys.add(k);
+    return true;
+  }
+  const res = await pool.query(
+    `INSERT INTO sent_push_alerts (device_id, alert_key)
+     VALUES ($1, $2)
+     ON CONFLICT (device_id, alert_key) DO NOTHING
+     RETURNING alert_key`,
+    [deviceId, alertKey]
+  );
+  return (res.rowCount ?? 0) > 0;
+}
+
+export async function clearInvalidApnsToken(deviceId: string): Promise<void> {
+  if (!pool) {
+    const existing = memoryPushSubs.get(deviceId);
+    if (existing) existing.apnsToken = undefined;
+    return;
+  }
+  await pool.query(`UPDATE push_subscriptions SET apns_token = NULL WHERE device_id = $1`, [deviceId]);
 }

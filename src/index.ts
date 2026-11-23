@@ -42,9 +42,17 @@ import {
   countRecentSightings,
   saveSocialPromo,
   getRecentSocialPromos,
+  upsertPushSubscription,
+  getPushSubscription,
+  listActiveApnsSubscriptions,
+  markPushAlertSentIfNew,
+  clearInvalidApnsToken,
   pingDB,
+  type PushSubscriptionRecord,
   type RecallRow,
+  type WatchedAlertRule,
 } from "./db.js";
+import { isApnsConfigured, sendApnsPush } from "./push.js";
 import {
   areComparablePair,
   classifyPairMatch,
@@ -258,7 +266,8 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "2.5.0",
+    version: "2.6.0",
+    apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
     endpoints: [
@@ -1133,6 +1142,222 @@ app.get("/promo/recent", async (req: Request, res: Response) => {
   res.json({ count: promos.length, promos });
 });
 
+// ─── Instant Price-Drop & Wednesday Half-Price Push Alert Engine ─────────────
+
+const VALID_ALERT_CATEGORIES = new Set(["nappies", "formula", "pouch", "cereal", "snack", "other"]);
+
+interface MatchedDropAlert {
+  alertKey: string;
+  specialId: string;
+  title: string;
+  body: string;
+  retailer: string;
+  productName: string;
+  price: number;
+  wasPrice: number;
+  savingsAmount: number;
+  savingsPercent: number;
+  category: string;
+}
+
+function matchDropsForSubscription(
+  sub: PushSubscriptionRecord,
+  specials: SpecialEntry[]
+): MatchedDropAlert[] {
+  const matches: MatchedDropAlert[] = [];
+  const seenIds = new Set<string>();
+  const allowedCats = new Set(sub.alertCategories);
+
+  // 1. Custom watched products & target prices (works for both Free 1-item & Bubstock+ unlimited)
+  for (const rule of sub.watchedRules) {
+    const tokens = rule.name
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((t) => t.length >= 3 && !["baby", "infant", "pack", "from", "with"].includes(t))
+      .slice(0, 4);
+    if (tokens.length === 0) continue;
+
+    for (const sp of specials) {
+      if (seenIds.has(sp.id)) continue;
+      const hay = sp.name.toLowerCase();
+      const hits = tokens.filter((t) => hay.includes(t)).length;
+      if (hits < Math.min(2, tokens.length)) continue;
+
+      const hitTarget = typeof rule.targetPrice === "number" && rule.targetPrice > 0 && sp.price <= rule.targetPrice;
+      const hitGoodSale = sp.savingsPercent >= 25;
+      if (!hitTarget && !hitGoodSale) continue;
+
+      seenIds.add(sp.id);
+      const saveStr = sp.savingsAmount.toFixed(2);
+      const title = hitTarget
+        ? `🎯 Target Price Hit at ${sp.retailer}!`
+        : `🔥 ${sp.savingsPercent}% OFF at ${sp.retailer} — save $${saveStr}`;
+      const body = `${sp.name} just dropped to $${sp.price.toFixed(2)} (was $${sp.wasPrice.toFixed(2)} — save $${saveStr}).`;
+      matches.push({
+        alertKey: `sp:${sp.id}:${sp.price.toFixed(2)}`,
+        specialId: sp.id,
+        title,
+        body,
+        retailer: sp.retailer,
+        productName: sp.name,
+        price: sp.price,
+        wasPrice: sp.wasPrice,
+        savingsAmount: sp.savingsAmount,
+        savingsPercent: sp.savingsPercent,
+        category: sp.category,
+      });
+    }
+  }
+
+  // 2. Bubstock+ Instant Half-Price / Big-Discount Category Drops (e.g. "Huggies Size 4 just hit 50% off at Coles — save $19!")
+  if (sub.hasPlus && sub.halfPriceEnabled) {
+    const minPct = Math.min(Math.max(sub.minDiscountPercent || 40, 20), 60);
+    for (const sp of specials) {
+      if (seenIds.has(sp.id)) continue;
+      if (sp.savingsPercent < minPct) continue;
+      if (allowedCats.size > 0 && !allowedCats.has(sp.category)) continue;
+
+      seenIds.add(sp.id);
+      const saveStr = sp.savingsAmount.toFixed(2);
+      matches.push({
+        alertKey: `sp:${sp.id}:${sp.price.toFixed(2)}`,
+        specialId: sp.id,
+        title: `🔥 ${sp.name.slice(0, 38)} hit ${sp.savingsPercent}% off at ${sp.retailer}`,
+        body: `Now $${sp.price.toFixed(2)} (was $${sp.wasPrice.toFixed(2)}) — save $${saveStr}! Tap to compare nearby stores.`,
+        retailer: sp.retailer,
+        productName: sp.name,
+        price: sp.price,
+        wasPrice: sp.wasPrice,
+        savingsAmount: sp.savingsAmount,
+        savingsPercent: sp.savingsPercent,
+        category: sp.category,
+      });
+    }
+  }
+
+  return matches
+    .sort((a, b) => b.savingsPercent - a.savingsPercent || b.savingsAmount - a.savingsAmount)
+    .slice(0, 5);
+}
+
+app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
+  const {
+    deviceId,
+    apnsToken,
+    city = "melbourne",
+    state = "VIC",
+    hasPlus = false,
+    halfPriceEnabled = false,
+    minDiscountPercent = 40,
+    alertCategories = ["nappies", "formula"],
+    watchedRules = [],
+  } = req.body ?? {};
+
+  const cleanDeviceId = sanitizeText(deviceId, 80);
+  if (cleanDeviceId.length < 8) {
+    res.status(400).json({ error: "Valid deviceId required" });
+    return;
+  }
+
+  const cleanToken =
+    typeof apnsToken === "string"
+      ? apnsToken.replace(/[^a-fA-F0-9]/g, "").slice(0, 160) || undefined
+      : undefined;
+  const upperState = String(state).toUpperCase() as AuStateUpper;
+  const cleanState: AuStateUpper = VALID_AU_STATES.has(upperState) ? upperState : "VIC";
+  const cleanCats = Array.isArray(alertCategories)
+    ? alertCategories.map((c) => String(c).toLowerCase()).filter((c) => VALID_ALERT_CATEGORIES.has(c))
+    : ["nappies", "formula"];
+  const cleanRules: WatchedAlertRule[] = Array.isArray(watchedRules)
+    ? watchedRules.slice(0, hasPlus ? 30 : 2).flatMap((r) => {
+        if (!r || typeof r !== "object") return [];
+        const productId = sanitizeText((r as any).productId, 80);
+        const name = sanitizeText((r as any).name, 140);
+        if (!productId || name.length < 3) return [];
+        const tp = Number((r as any).targetPrice);
+        const targetPrice = Number.isFinite(tp) && tp >= 0.5 && tp <= 250 ? Number(tp.toFixed(2)) : undefined;
+        return [{ productId, name, targetPrice }];
+      })
+    : [];
+
+  await upsertPushSubscription({
+    deviceId: cleanDeviceId,
+    apnsToken: cleanToken,
+    city: sanitizeText(city, 30) || "melbourne",
+    state: cleanState,
+    hasPlus: Boolean(hasPlus),
+    halfPriceEnabled: Boolean(halfPriceEnabled),
+    minDiscountPercent: Math.min(Math.max(Number(minDiscountPercent) || 40, 20), 60),
+    alertCategories: cleanCats.length > 0 ? cleanCats : ["nappies", "formula"],
+    watchedRules: cleanRules,
+  });
+
+  res.status(200).json({
+    synced: true,
+    apnsEnabled: isApnsConfigured() && Boolean(cleanToken),
+    rulesCount: cleanRules.length,
+  });
+});
+
+app.get("/alerts/check", async (req: Request, res: Response) => {
+  const deviceId = sanitizeText(req.query.deviceId, 80);
+  if (deviceId.length < 8) {
+    res.status(400).json({ error: "deviceId required" });
+    return;
+  }
+
+  const sub = await getPushSubscription(deviceId);
+  if (!sub) {
+    res.json({ alerts: [], count: 0 });
+    return;
+  }
+
+  const specials = await loadLiveSpecials();
+  const matched = matchDropsForSubscription(sub, specials);
+  const fresh: MatchedDropAlert[] = [];
+
+  for (const item of matched.slice(0, 3)) {
+    const isNew = await markPushAlertSentIfNew(deviceId, item.alertKey);
+    if (isNew) fresh.push(item);
+  }
+
+  res.json({
+    count: fresh.length,
+    alerts: fresh,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+async function dispatchScheduledPushSweep(): Promise<void> {
+  if (!isApnsConfigured()) return;
+  const [specials, subs] = await Promise.all([loadLiveSpecials(), listActiveApnsSubscriptions()]);
+  if (specials.length === 0 || subs.length === 0) return;
+
+  let sent = 0;
+  for (const sub of subs) {
+    if (!sub.apnsToken) continue;
+    const matches = matchDropsForSubscription(sub, specials);
+    for (const drop of matches.slice(0, 2)) {
+      const isNew = await markPushAlertSentIfNew(sub.deviceId, drop.alertKey);
+      if (!isNew) continue;
+      const result = await sendApnsPush(sub.apnsToken, {
+        title: drop.title,
+        body: drop.body,
+        threadId: "bubstock-price-drops",
+        data: { specialId: drop.specialId, retailer: drop.retailer },
+      });
+      if (result.ok) {
+        sent++;
+      } else if (result.status === 410 || result.reason === "BadDeviceToken" || result.reason === "Unregistered") {
+        await clearInvalidApnsToken(sub.deviceId).catch(() => {});
+        break;
+      }
+    }
+  }
+  log("info", "scheduled APNs price-drop sweep finished", { subscribers: subs.length, sent });
+}
+
 // ─── City Live Pulse Telemetry (/pulse + backwards-compatible /melbourne/pulse)
 
 async function handlePulse(req: Request, res: Response) {
@@ -1198,6 +1423,20 @@ cron.schedule("30 */4 * * *", async () => {
   await loadLiveSpecials().catch((e) =>
     log("error", "cron specials failed", { err: (e as Error).message })
   );
+  await dispatchScheduledPushSweep().catch((e) =>
+    log("error", "cron push sweep failed", { err: (e as Error).message })
+  );
+});
+
+// Wednesday 7:05 AM AEST (21:05 UTC Tuesday) — Woolworths & Coles weekly catalogue reset push!
+cron.schedule("5 21 * * 2", async () => {
+  specialsCache.clear();
+  await loadLiveSpecials().catch((e) =>
+    log("error", "wednesday catalogue refresh failed", { err: (e as Error).message })
+  );
+  await dispatchScheduledPushSweep().catch((e) =>
+    log("error", "wednesday push sweep failed", { err: (e as Error).message })
+  );
 });
 
 cron.schedule("0 3 * * *", async () => {
@@ -1210,7 +1449,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "2.5.0" });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "2.6.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })
