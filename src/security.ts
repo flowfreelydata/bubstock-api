@@ -364,8 +364,14 @@ export async function securityContextMiddleware(
     }
   }
 
+  // CGNAT safety (Telstra/Optus/Vodafone shared carrier IPs):
+  // A cryptographically verified, clean, non-tampered hardware-attested iPhone proves it is a
+  // genuine parent device and is never penalized if an unrelated scraper shared the same mobile IP.
+  const verifiedCleanHardware =
+    ctx.isAttested && !ctx.isTamperedClient && !ctx.isReplayAttack && !ctx.isScraperUa;
+
   // Classify hostile IPs & scraper bots for Ghost Mirage + Progressive Tarpit
-  if (!ctx.useMirage && (ctx.isHostile || ctx.isScraperUa)) {
+  if (!ctx.useMirage && !verifiedCleanHardware && (ctx.isHostile || ctx.isScraperUa)) {
     ctx.useMirage = true;
     ctx.mirageReason = ctx.isHostile ? "hostile_fingerprint" : "automated_scraper_ua";
     if (ctx.isScraperUa && !ctx.isHostile) {

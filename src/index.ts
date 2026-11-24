@@ -1356,8 +1356,16 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
       : undefined;
 
   // Project Zero Shadow-Quarantine: check if this device/IP/binary is already shadow-banned
+  // (Clean hardware-attested iPhones are immune to carrier CGNAT IP spillover)
+  const cleanHardware = Boolean(
+    req.security?.isAttested && !req.security?.isTamperedClient && !req.security?.isReplayAttack && !req.security?.isScraperUa
+  );
   let shadowBan =
-    Boolean(req.security?.isTamperedClient || req.security?.isHostile || req.security?.isScraperUa) ||
+    Boolean(
+      req.security?.isTamperedClient ||
+        req.security?.isScraperUa ||
+        (!cleanHardware && req.security?.isHostile)
+    ) ||
     (await isDeviceShadowBanned(cleanDeviceId));
 
   // Detect coordinated out-of-stock sabotage bursts (>5 distinct stores marked likelyGone in 10 min)
