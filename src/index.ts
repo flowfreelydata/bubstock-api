@@ -59,11 +59,33 @@ import {
   getSuburbShortages,
   detectShrinkflation,
   getCategoryMedians,
+  isDeviceShadowBanned,
+  recordDeviceStrike,
+  countRecentLikelyGoneByDevice,
+  getSecurityTelemetrySummary,
   pingDB,
   type PushSubscriptionRecord,
   type RecallRow,
   type WatchedAlertRule,
 } from "./db.js";
+import {
+  enrollHardwareKey,
+  issueAttestChallenge,
+  securityContextMiddleware,
+  verifyStoreKitJwsCrypto,
+} from "./security.js";
+import {
+  applyProgressiveTarpit,
+  clearHostileIp,
+  hashIp,
+  mountHoneypotRoutes,
+  transformToGhostComparison,
+  transformToGhostGaps,
+  transformToGhostHistory,
+  transformToGhostPrices,
+  transformToGhostSpecials,
+  warmHostileCache,
+} from "./deception.js";
 import {
   SEO_FLAGSHIP_SLUGS,
   renderCostIndexPage,
@@ -220,46 +242,10 @@ const ALLOWED_BROWSER_ORIGINS = new Set([
   "https://www.bubstock.com.au",
 ]);
 
-const SCRAPER_BOT_UA_RE =
-  /\b(python-requests|python-urllib|scrapy|aiohttp|httpx|go-http-client|wget|libwww-perl|java\/|okhttp|axios\/|node-fetch|puppeteer|playwright|selenium|headlesschrome)\b/i;
-
 const ALLOWED_IMAGE_URL_RE =
   /^https:\/\/([a-z0-9-]+\.)?(woolworths\.com\.au|woolworths\.media|coles\.com\.au|igashop\.com\.au|priceline\.com\.au|aldi\.com\.au|aldi\.cx|chemistwarehouse\.com\.au|babybunting\.com\.au)\//i;
 
 const SEO_FLAGSHIP_SLUG_SET = new Set(SEO_FLAGSHIP_SLUGS);
-
-function isValidStoreKitJws(jws: unknown): boolean {
-  if (typeof jws !== "string") return false;
-  const parts = jws.trim().split(".");
-  if (parts.length !== 3) return false;
-  try {
-    const header = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8")) as {
-      alg?: string;
-      x5c?: unknown[];
-    };
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as {
-      bundleId?: string;
-      productId?: string;
-      expiresDate?: number;
-    };
-    if (header.alg !== "ES256" || !Array.isArray(header.x5c) || header.x5c.length === 0) {
-      return false;
-    }
-    if (payload.bundleId !== "au.com.bubstock.app") return false;
-    if (
-      payload.productId !== "au.com.bubstock.plus.monthly" &&
-      payload.productId !== "au.com.bubstock.plus.yearly"
-    ) {
-      return false;
-    }
-    if (typeof payload.expiresDate === "number" && payload.expiresDate < Date.now() - 60_000) {
-      return false;
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(
@@ -275,20 +261,40 @@ app.use(
     methods: ["GET", "POST"],
   })
 );
-app.use(express.json({ limit: "256kb" }));
+app.use(
+  express.json({
+    limit: "256kb",
+    verify: (req, _res, buf) => {
+      (req as Request).rawBody = buf;
+    },
+  })
+);
 
-// Block automated third-party scraper libraries on JSON API routes & forbid indexing raw JSON
+// Apple SEAR Hardware Attestation + Project Zero Threat Classifier
+app.use(securityContextMiddleware);
+
+// Block untrusted cross-origin browser requests; let automated scrapers & hostile fingerprints
+// on read-only price routes fall silently into the Ghost Price Mirage + Canary + Tarpit trap.
 function antiLeechGuard(req: Request, res: Response, next: NextFunction): void {
   res.setHeader("X-Robots-Tag", "noindex, nofollow");
-  const ua = String(req.headers["user-agent"] ?? "");
   const origin = String(req.headers["origin"] ?? "");
   if (origin && !ALLOWED_BROWSER_ORIGINS.has(origin.toLowerCase())) {
     res.status(403).json({ error: "Cross-origin API access is not permitted" });
     return;
   }
-  if (SCRAPER_BOT_UA_RE.test(ua)) {
-    log("warn", "blocked automated scraper UA on JSON API", { path: req.path, ua: ua.slice(0, 80) });
-    res.status(403).json({ error: "Automated bulk scraping is not permitted" });
+  next();
+}
+
+// Strict guard for write/private endpoints (vaults, referrals, syndicates)
+function strictBotGuard(req: Request, res: Response, next: NextFunction): void {
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  const origin = String(req.headers["origin"] ?? "");
+  if (origin && !ALLOWED_BROWSER_ORIGINS.has(origin.toLowerCase())) {
+    res.status(403).json({ error: "Cross-origin API access is not permitted" });
+    return;
+  }
+  if (req.security?.isScraperUa) {
+    res.status(403).json({ error: "Automated bot access is not permitted" });
     return;
   }
   next();
@@ -386,12 +392,15 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "2.9.0",
+    version: "3.0.0",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
     endpoints: [
       "/health",
+      "/attest/challenge",
+      "/attest/enroll",
+      "/entitlements/verify",
       "/pulse?city=melbourne|sydney|brisbane|perth|adelaide|tasmania",
       "/melbourne/pulse",
       "/prices",
@@ -417,6 +426,93 @@ app.get("/", (_req, res) => {
       "/sitemap.xml",
     ],
   });
+});
+
+// ─── Project Zero Honeypot Tripwires (Never Called by Legitimate App) ────────
+mountHoneypotRoutes(app);
+
+// ─── Apple SEAR Hardware Attestation & Zero-Trust Entitlement Verification ───
+
+app.get("/attest/challenge", strictBotGuard, sightingLimit, (req: Request, res: Response) => {
+  const ipHash = req.security?.ipHash ?? hashIp(req.ip);
+  const issued = issueAttestChallenge(ipHash);
+  res.setHeader("Cache-Control", "no-store, private");
+  res.json(issued);
+});
+
+app.post("/attest/enroll", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
+  const ipHash = req.security?.ipHash ?? hashIp(req.ip);
+  const result = await enrollHardwareKey({
+    keyId: req.body?.keyId,
+    publicKeyB64: req.body?.publicKeyB64,
+    challenge: req.body?.challenge,
+    challengeSignatureB64: req.body?.challengeSignatureB64,
+    attestMode: req.body?.attestMode,
+    appAttestObjectB64: req.body?.appAttestObjectB64,
+    bundleId: req.body?.bundleId,
+    ipHash,
+  });
+  res.setHeader("Cache-Control", "no-store, private");
+  if (!result.ok) {
+    res.status(result.status).json({ enrolled: false, error: result.error });
+    return;
+  }
+  res.status(result.status).json({ enrolled: true, mode: result.mode });
+});
+
+app.post("/entitlements/verify", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
+  const storekitJws = req.body?.storekitJws ?? req.headers["x-bubstock-receipt"];
+  const cleanDeviceId = sanitizeText(req.body?.deviceId, 80);
+
+  const cryptoResult = verifyStoreKitJwsCrypto(storekitJws);
+  const previewActive =
+    !cryptoResult.valid && cleanDeviceId.length >= 8
+      ? await hasDeviceVerifiedPromoOrReferral(cleanDeviceId)
+      : false;
+
+  res.setHeader("Cache-Control", "no-store, private");
+  res.json({
+    paidSubscriber: cryptoResult.valid,
+    previewActive,
+    hasPlus: cryptoResult.valid || previewActive,
+    verifiedBy: cryptoResult.valid
+      ? "apple_es256_jws"
+      : previewActive
+        ? "postgres_preview"
+        : "none",
+    productId: cryptoResult.productId ?? null,
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+app.get("/admin/security/summary", async (req: Request, res: Response) => {
+  const adminKey = process.env.ADMIN_API_KEY ?? process.env.INGEST_API_KEY;
+  if (!adminKey || !timingSafeKeyMatch(req.headers["x-admin-key"], adminKey)) {
+    res.status(403).json({ error: "Forbidden — admin key required" });
+    return;
+  }
+  const summary = await getSecurityTelemetrySummary();
+  res.setHeader("Cache-Control", "no-store, private");
+  res.json({
+    service: "bubstock-au-api",
+    version: "3.0.0",
+    ...summary,
+    generatedAt: new Date().toISOString(),
+  });
+});
+
+app.post("/admin/security/unblock-ip", async (req: Request, res: Response) => {
+  const adminKey = process.env.ADMIN_API_KEY ?? process.env.INGEST_API_KEY;
+  if (!adminKey || !timingSafeKeyMatch(req.headers["x-admin-key"], adminKey)) {
+    res.status(403).json({ error: "Forbidden — admin key required" });
+    return;
+  }
+  const targetIp = typeof req.body?.ip === "string" && req.body.ip.trim() ? req.body.ip.trim() : req.ip;
+  const ipHash = hashIp(targetIp);
+  clearHostileIp(ipHash);
+  const { pool } = await import("./db.js");
+  await pool?.query(`DELETE FROM hostile_fingerprints WHERE ip_hash = $1`, [ipHash]).catch(() => {});
+  res.json({ unblocked: true, ipHash });
 });
 
 app.get("/health", async (_req, res) => {
@@ -655,6 +751,12 @@ app.get("/prices", antiLeechGuard, priceLimit, async (req: Request, res: Respons
   });
 
   const result = await resolveMultiRetailerPrices(cleanProduct, cleanSuburb, ctx.state);
+  if (req.security?.useMirage) {
+    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
+    res.setHeader("Cache-Control", "no-store, private");
+    res.json(transformToGhostPrices(result, req.security.ipHash));
+    return;
+  }
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=900");
   res.json(result);
 });
@@ -739,6 +841,13 @@ app.get("/compare", antiLeechGuard, priceLimit, async (req: Request, res: Respon
     fetchedAt: result.fetchedAt,
   };
 
+  if (req.security?.useMirage) {
+    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
+    res.setHeader("Cache-Control", "no-store, private");
+    res.json(transformToGhostComparison(comparison, req.security.ipHash));
+    return;
+  }
+
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=900");
   res.json(comparison);
 });
@@ -749,13 +858,28 @@ app.get("/compare/gaps", antiLeechGuard, dataDumpLimit, async (req: Request, res
   const ctx = resolveCityAndState(req);
   const gaps = await singleflight("compare:gaps", () => getColesVsWoolworthsGaps(72));
   const withSavings = gaps.filter((g) => g.savingsAmount >= 0.2);
+  const visible = withSavings.length > 0 ? withSavings.slice(0, 40) : gaps.slice(0, 40);
+
+  if (req.security?.useMirage) {
+    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
+    const miraged = transformToGhostGaps(visible, req.security.ipHash);
+    res.setHeader("Cache-Control", "no-store, private");
+    res.json({
+      region: ctx.regionLabel,
+      totalMatchedPairs: miraged.length,
+      gapsCount: miraged.length,
+      gaps: miraged,
+      fetchedAt: new Date().toISOString(),
+    });
+    return;
+  }
 
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=900");
   res.json({
     region: ctx.regionLabel,
     totalMatchedPairs: gaps.length,
     gapsCount: withSavings.length,
-    gaps: withSavings.length > 0 ? withSavings.slice(0, 40) : gaps.slice(0, 40),
+    gaps: visible,
     fetchedAt: new Date().toISOString(),
   });
 });
@@ -915,9 +1039,9 @@ app.post("/specials/ingest", ingestLimit, async (req: Request, res: Response) =>
   res.status(201).json({ ingested: valid.length });
 });
 
-// ─── Real Price History (Postgres) ───────────────────────────────────────────
+// ─── Real Price History (Postgres + Zero-Trust Deep Archive Gate) ────────────
 
-app.get("/prices/history", async (req: Request, res: Response) => {
+app.get("/prices/history", antiLeechGuard, async (req: Request, res: Response) => {
   const { product, weeks = "12" } = req.query;
   if (!product || typeof product !== "string" || product.trim().length < 2) {
     res.status(400).json({ error: "product query param required" });
@@ -926,16 +1050,31 @@ app.get("/prices/history", async (req: Request, res: Response) => {
 
   const ctx = resolveCityAndState(req);
   const cleanSuburb = String(req.query.suburb ?? ctx.defaultSuburb);
+  const requestedWeeks = Math.min(Math.max(Number(weeks) || 12, 1), 52);
 
-  let rows = await getPriceHistory(
-    product.trim(),
-    cleanSuburb,
-    ctx.state,
-    Math.min(Number(weeks) || 12, 52)
-  );
+  // Zero-Trust Server-Side Entitlement Gate: deep 13–52 week historical dumps require
+  // a cryptographically verified Apple StoreKit 2 ES256 JWS receipt header.
+  const deepArchiveAllowed =
+    requestedWeeks <= 12 || verifyStoreKitJwsCrypto(req.headers["x-bubstock-receipt"]).valid;
+  const effectiveWeeks = deepArchiveAllowed ? requestedWeeks : 12;
+
+  let rows = await getPriceHistory(product.trim(), cleanSuburb, ctx.state, effectiveWeeks);
   // Fall back to VIC chain history if newer state archive is still building up (same national chain pricing)
   if (rows.length === 0 && ctx.state !== "VIC") {
-    rows = await getPriceHistory(product.trim(), "Melbourne", "VIC", Math.min(Number(weeks) || 12, 52));
+    rows = await getPriceHistory(product.trim(), "Melbourne", "VIC", effectiveWeeks);
+  }
+
+  if (req.security?.useMirage) {
+    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
+    res.setHeader("Cache-Control", "no-store, private");
+    res.json({
+      productName: product.trim(),
+      suburb: cleanSuburb,
+      state: ctx.state,
+      weeks: transformToGhostHistory(rows, req.security.ipHash),
+      fetchedAt: new Date().toISOString(),
+    });
+    return;
   }
 
   res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600");
@@ -995,6 +1134,19 @@ app.get("/specials", antiLeechGuard, dataDumpLimit, async (req: Request, res: Re
     if (retailer !== "all" && s.retailer.toLowerCase() !== retailer) return false;
     return true;
   });
+
+  if (req.security?.useMirage) {
+    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
+    const miraged = transformToGhostSpecials(filtered, req.security.ipHash);
+    res.setHeader("Cache-Control", "no-store, private");
+    res.json({
+      region: ctx.regionLabel,
+      count: miraged.length,
+      specials: miraged,
+      fetchedAt: new Date().toISOString(),
+    });
+    return;
+  }
 
   res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600, stale-while-revalidate=1800");
   res.json({
@@ -1167,10 +1319,12 @@ app.get("/sightings", async (req: Request, res: Response) => {
   const ctx = resolveCityAndState(req);
   const productId = typeof req.query.productId === "string" ? req.query.productId.trim() : undefined;
   const storeId = typeof req.query.storeId === "string" ? req.query.storeId.trim() : undefined;
+  const viewerDeviceId =
+    typeof req.query.deviceId === "string" ? sanitizeText(req.query.deviceId, 80) || undefined : undefined;
   const hours = Number(req.query.hours ?? 72) || 72;
   const limit = Number(req.query.limit ?? 100) || 100;
 
-  const sightings = await getSightings({ productId, storeId, hours, limit });
+  const sightings = await getSightings({ productId, storeId, hours, limit, viewerDeviceId });
   res.json({
     region: ctx.regionLabel,
     count: sightings.length,
@@ -1201,27 +1355,55 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
       ? Number(observedPrice.toFixed(2))
       : undefined;
 
-  // Statistical Anti-Poisoning Guard: compare submitted shelf price against real 90-day Postgres median
-  // to block accidental typos ($1.00 formula) or malicious price poisoning while allowing real 60% clearance markdowns.
+  // Project Zero Shadow-Quarantine: check if this device/IP/binary is already shadow-banned
+  let shadowBan =
+    Boolean(req.security?.isTamperedClient || req.security?.isHostile || req.security?.isScraperUa) ||
+    (await isDeviceShadowBanned(cleanDeviceId));
+
+  // Detect coordinated out-of-stock sabotage bursts (>5 distinct stores marked likelyGone in 10 min)
+  if (!shadowBan && state === "likelyGone" && cleanDeviceId) {
+    const recentOutStores = await countRecentLikelyGoneByDevice(cleanDeviceId, 10);
+    if (recentOutStores >= 5) {
+      await recordDeviceStrike(cleanDeviceId, "likely_gone_sabotage_burst", true);
+      shadowBan = true;
+      log("warn", "silently shadow-banned sabotage burst device", { storesIn10m: recentOutStores });
+    }
+  }
+
+  // Statistical Anti-Poisoning Guard: compare submitted shelf price against real 90-day Postgres median.
+  // Strike 1 returns a friendly 422 so honest parents can fix a typo;
+  // Strike 2+ silently shadow-bans the poisoner so they think their fake price worked while ZERO parents see it!
   if (parsedPrice !== undefined && cleanProductName.length >= 3) {
     const stats = await getMedianProductPrice(cleanProductName);
     if (stats && stats.median >= 2.0) {
       const minAllowed = Number(Math.max(0.5, stats.median * 0.35).toFixed(2));
       const maxAllowed = Number((stats.median * 2.25).toFixed(2));
       if (parsedPrice < minAllowed || parsedPrice > maxAllowed) {
-        log("warn", "rejected outlier shelf sighting price", {
-          productName: cleanProductName,
-          submitted: parsedPrice,
-          median: stats.median,
-          minAllowed,
-          maxAllowed,
-        });
-        res.status(422).json({
-          error: `Price $${parsedPrice.toFixed(2)} looks far outside the verified AU median ($${stats.median.toFixed(2)}) for this item. Please double-check the shelf tag.`,
-          rejectedAsOutlier: true,
-          expectedRange: { min: minAllowed, max: maxAllowed, median: stats.median },
-        });
-        return;
+        if (!shadowBan) {
+          const strike = await recordDeviceStrike(cleanDeviceId, "outlier_price_poisoning");
+          if (strike.isBanned) {
+            shadowBan = true;
+            log("warn", "silently shadow-banned repeat price poisoner", {
+              productName: cleanProductName,
+              submitted: parsedPrice,
+              strikes: strike.strikes,
+            });
+          } else {
+            log("warn", "rejected outlier shelf sighting price (strike 1)", {
+              productName: cleanProductName,
+              submitted: parsedPrice,
+              median: stats.median,
+              minAllowed,
+              maxAllowed,
+            });
+            res.status(422).json({
+              error: `Price $${parsedPrice.toFixed(2)} looks far outside the verified AU median ($${stats.median.toFixed(2)}) for this item. Please double-check the shelf tag.`,
+              rejectedAsOutlier: true,
+              expectedRange: { min: minAllowed, max: maxAllowed, median: stats.median },
+            });
+            return;
+          }
+        }
       }
     }
   }
@@ -1237,14 +1419,16 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
     observedPrice: parsedPrice,
     note: sanitizeText(note, 240) || undefined,
     deviceId: cleanDeviceId,
+    isShadowBanned: shadowBan,
   });
 
-  log("info", "shelf sighting recorded", {
+  log("info", shadowBan ? "shadow-quarantined shelf sighting" : "shelf sighting recorded", {
     productId: sighting.productId,
     storeId: sighting.storeId,
     suburb: sighting.suburb,
     state: sighting.state,
     corroborationCount: sighting.corroborationCount,
+    shadowBanned: shadowBan,
   });
 
   res.status(201).json({ sighting });
@@ -1467,9 +1651,9 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
     return;
   }
 
-  // Server-side entitlement verification: do not trust self-declared `hasPlus: true`
-  // unless backed by a StoreKit 2 signed ES256 JWS transaction or verified Postgres preview claim.
-  const verifiedStoreKit = isValidStoreKitJws(storekitJws);
+  // Zero-Trust server-side entitlement verification: cryptographically verify StoreKit 2 ES256 JWS
+  // (X.509 Apple chain + ECDSA P-256 signature) OR verified Postgres preview claim.
+  const verifiedStoreKit = verifyStoreKitJwsCrypto(storekitJws ?? req.headers["x-bubstock-receipt"]).valid;
   const verifiedPreview = !verifiedStoreKit && hasPlus
     ? await hasDeviceVerifiedPromoOrReferral(cleanDeviceId)
     : false;
@@ -1615,7 +1799,7 @@ app.get("/melbourne/pulse", handlePulse);
 
 // ─── Zero-Knowledge E2EE Two-Parent Household Sync (Write-Proof Protected) ───
 
-app.post("/household/sync", antiLeechGuard, vaultWriteLimit, async (req: Request, res: Response) => {
+app.post("/household/sync", strictBotGuard, vaultWriteLimit, async (req: Request, res: Response) => {
   const vaultId = typeof req.body?.vaultId === "string" ? req.body.vaultId.trim().toLowerCase() : "";
   const writeToken = typeof req.body?.writeToken === "string" ? req.body.writeToken.trim().toLowerCase() : "";
   const ciphertext = typeof req.body?.ciphertext === "string" ? req.body.ciphertext.trim() : "";
@@ -1642,7 +1826,7 @@ app.post("/household/sync", antiLeechGuard, vaultWriteLimit, async (req: Request
   res.status(200).json({ synced: true, updatedAt: saved.updatedAt });
 });
 
-app.get("/household/sync/:vaultId", antiLeechGuard, vaultReadLimit, async (req: Request, res: Response) => {
+app.get("/household/sync/:vaultId", strictBotGuard, vaultReadLimit, async (req: Request, res: Response) => {
   const vaultId = String(req.params.vaultId ?? "").trim().toLowerCase();
   if (!/^[a-f0-9]{32,64}$/.test(vaultId)) {
     res.status(400).json({ error: "Invalid vaultId" });
@@ -1891,11 +2075,17 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "2.9.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "3.0.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })
   );
+
+  warmHostileCache()
+    .then((count) => {
+      if (count > 0) log("info", "loaded active hostile fingerprints", { count });
+    })
+    .catch(() => {});
 
   fetchAllOfficialRecalls()
     .then((fresh) => {

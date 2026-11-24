@@ -143,12 +143,16 @@ export async function initSchema(): Promise<void> {
       );
 
       ALTER TABLE shelf_sightings ADD COLUMN IF NOT EXISTS device_hash TEXT;
+      ALTER TABLE shelf_sightings ADD COLUMN IF NOT EXISTS is_shadow_banned BOOLEAN NOT NULL DEFAULT FALSE;
 
       CREATE INDEX IF NOT EXISTS idx_sightings_product_store
         ON shelf_sightings(product_id, store_id, reported_at DESC);
 
       CREATE INDEX IF NOT EXISTS idx_sightings_recent
         ON shelf_sightings(reported_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_sightings_visible
+        ON shelf_sightings(is_shadow_banned, reported_at DESC);
 
       CREATE TABLE IF NOT EXISTS social_promos (
         id            TEXT PRIMARY KEY,
@@ -219,6 +223,50 @@ export async function initSchema(): Promise<void> {
         device_hash TEXT PRIMARY KEY,
         kind        TEXT NOT NULL,
         claimed_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS attested_keys (
+        key_id            TEXT PRIMARY KEY,
+        public_key_pem    TEXT NOT NULL,
+        attest_mode       TEXT NOT NULL DEFAULT 'secure_enclave',
+        app_attest_cbor   TEXT,
+        bundle_id         TEXT NOT NULL DEFAULT 'au.com.bubstock.app',
+        last_counter      BIGINT NOT NULL DEFAULT 0,
+        taint_mask        INT NOT NULL DEFAULT 0,
+        enrolled_ip_hash  TEXT,
+        enrolled_at       TIMESTAMPTZ DEFAULT NOW(),
+        last_seen_at      TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS hostile_fingerprints (
+        ip_hash       TEXT PRIMARY KEY,
+        threat_score  INT NOT NULL DEFAULT 100,
+        reason        TEXT NOT NULL,
+        hit_count     INT NOT NULL DEFAULT 1,
+        first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+        last_seen_at  TIMESTAMPTZ DEFAULT NOW(),
+        expires_at    TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '7 days'
+      );
+
+      CREATE TABLE IF NOT EXISTS honeypot_hits (
+        id          SERIAL PRIMARY KEY,
+        ip_hash     TEXT NOT NULL,
+        path        TEXT NOT NULL,
+        method      TEXT NOT NULL,
+        user_agent  TEXT,
+        reason      TEXT NOT NULL,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_honeypot_hits_recent
+        ON honeypot_hits(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS shadow_banned_devices (
+        device_hash TEXT PRIMARY KEY,
+        strikes     INT NOT NULL DEFAULT 1,
+        is_banned   BOOLEAN NOT NULL DEFAULT FALSE,
+        reason      TEXT NOT NULL,
+        updated_at  TIMESTAMPTZ DEFAULT NOW()
       );
     `);
     console.log("[db] schema ready");
@@ -713,15 +761,17 @@ export interface NewSightingInput {
   observedPrice?: number;
   note?: string;
   deviceId?: string;
+  isShadowBanned?: boolean;
 }
 
-function hashDeviceId(deviceId?: string): string | undefined {
+export function hashDeviceId(deviceId?: string): string | undefined {
   if (!deviceId || deviceId.trim().length < 4) return undefined;
   return crypto.createHash("sha256").update(`bubstock-trust-v1:${deviceId.trim()}`).digest("hex").slice(0, 16);
 }
 
 interface InternalMemorySighting extends ShelfSighting {
   deviceHash?: string;
+  isShadowBanned?: boolean;
 }
 const memorySightingsWithHash: InternalMemorySighting[] = memorySightings;
 
@@ -729,6 +779,7 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
   const id = crypto.randomUUID();
   const reportedAt = new Date().toISOString();
   const deviceHash = hashDeviceId(input.deviceId);
+  const shadow = Boolean(input.isShadowBanned);
   const sighting: ShelfSighting = {
     id,
     productId: input.productId,
@@ -746,13 +797,14 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
   };
 
   if (!pool) {
-    memorySightingsWithHash.unshift({ ...sighting, deviceHash });
+    memorySightingsWithHash.unshift({ ...sighting, deviceHash, isShadowBanned: shadow });
     if (memorySightingsWithHash.length > 1000) memorySightingsWithHash.pop();
     const cutoff = Date.now() - 12 * 3600 * 1000;
     const reporters = new Set(
       memorySightingsWithHash
         .filter(
           (s) =>
+            (!s.isShadowBanned || (shadow && s.deviceHash === deviceHash)) &&
             s.productId === sighting.productId &&
             s.storeId === sighting.storeId &&
             s.state === sighting.state &&
@@ -767,8 +819,8 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
 
   await pool.query(
     `INSERT INTO shelf_sightings
-       (id, product_id, product_name, store_id, store_name, suburb, retailer, state, observed_price, note, device_hash, reported_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+       (id, product_id, product_name, store_id, store_name, suburb, retailer, state, observed_price, note, device_hash, is_shadow_banned, reported_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
     [
       sighting.id,
       sighting.productId,
@@ -781,23 +833,25 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
       sighting.observedPrice ?? null,
       sighting.note ?? null,
       deviceHash ?? null,
+      shadow,
       sighting.reportedAt,
     ]
   );
 
-  // Count distinct local parents agreeing on this product/store/state within the last 12 hours
+  // Count distinct non-shadow-banned local parents agreeing on this product/store/state within 12 hours
   const corr = await pool.query(
     `SELECT COUNT(DISTINCT COALESCE(device_hash, id))::INT AS cnt
      FROM shelf_sightings
      WHERE product_id = $1
        AND store_id = $2
        AND state = $3
+       AND is_shadow_banned = FALSE
        AND reported_at >= NOW() - INTERVAL '12 hours'`,
     [sighting.productId, sighting.storeId, sighting.state]
   );
   const count = Math.max(1, Number(corr.rows[0]?.cnt ?? 1));
   sighting.corroborationCount = count;
-  sighting.verifiedByCommunity = count >= 2;
+  sighting.verifiedByCommunity = !shadow && count >= 2;
 
   return sighting;
 }
@@ -807,22 +861,25 @@ export async function getSightings(opts: {
   storeId?: string;
   hours?: number;
   limit?: number;
+  viewerDeviceId?: string;
 }): Promise<ShelfSighting[]> {
   const hours = Math.min(Math.max(opts.hours ?? 72, 1), 168);
   const limit = Math.min(Math.max(opts.limit ?? 100, 1), 250);
+  const viewerHash = hashDeviceId(opts.viewerDeviceId);
 
   if (!pool) {
     const cutoff = Date.now() - hours * 3600 * 1000;
     const corrCutoff = Date.now() - 12 * 3600 * 1000;
     const filtered = memorySightingsWithHash
       .filter((s) => new Date(s.reportedAt).getTime() >= cutoff)
+      .filter((s) => !s.isShadowBanned || (viewerHash !== undefined && s.deviceHash === viewerHash))
       .filter((s) => !opts.productId || s.productId === opts.productId)
       .filter((s) => !opts.storeId || s.storeId === opts.storeId)
       .slice(0, limit);
 
     const groups = new Map<string, Set<string>>();
     for (const s of filtered) {
-      if (new Date(s.reportedAt).getTime() >= corrCutoff) {
+      if (!s.isShadowBanned && new Date(s.reportedAt).getTime() >= corrCutoff) {
         const k = `${s.productId}|${s.storeId}|${s.state}`;
         const set = groups.get(k) ?? new Set<string>();
         set.add(s.deviceHash ?? s.id);
@@ -844,7 +901,7 @@ export async function getSightings(opts: {
         observedPrice: s.observedPrice,
         note: s.note,
         corroborationCount: count,
-        verifiedByCommunity: count >= 2,
+        verifiedByCommunity: !s.isShadowBanned && count >= 2,
         reportedAt: s.reportedAt,
       };
     });
@@ -852,6 +909,14 @@ export async function getSightings(opts: {
 
   const conditions = [`reported_at >= NOW() - ($1 || ' hours')::INTERVAL`];
   const params: Array<string | number> = [hours];
+
+  if (viewerHash) {
+    // Shadow-banned saboteurs see their own fake reports (mirage!), while real parents NEVER see them.
+    params.push(viewerHash);
+    conditions.push(`(is_shadow_banned = FALSE OR device_hash = $${params.length})`);
+  } else {
+    conditions.push(`is_shadow_banned = FALSE`);
+  }
 
   if (opts.productId) {
     params.push(opts.productId);
@@ -865,7 +930,7 @@ export async function getSightings(opts: {
 
   const result = await pool.query(
     `SELECT id, product_id, product_name, store_id, store_name, suburb, retailer,
-            state, observed_price::FLOAT8 AS observed_price, note, device_hash, reported_at
+            state, observed_price::FLOAT8 AS observed_price, note, device_hash, is_shadow_banned, reported_at
      FROM shelf_sightings
      WHERE ${conditions.join(" AND ")}
      ORDER BY reported_at DESC
@@ -873,10 +938,11 @@ export async function getSightings(opts: {
     params
   );
 
-  // Compute real distinct-parent corroboration within the last 12 hours
+  // Compute real distinct-parent corroboration within the last 12 hours (excluding shadow-banned rows)
   const corrCutoffMs = Date.now() - 12 * 3600 * 1000;
   const groups = new Map<string, Set<string>>();
   for (const r of result.rows) {
+    if (r.is_shadow_banned) continue;
     const ts = new Date(r.reported_at).getTime();
     if (ts >= corrCutoffMs) {
       const k = `${r.product_id}|${r.store_id}|${r.state}`;
@@ -901,7 +967,7 @@ export async function getSightings(opts: {
       observedPrice: r.observed_price ?? undefined,
       note: r.note ?? undefined,
       corroborationCount: count,
-      verifiedByCommunity: count >= 2,
+      verifiedByCommunity: !r.is_shadow_banned && count >= 2,
       reportedAt: new Date(r.reported_at).toISOString(),
     };
   });
@@ -910,11 +976,16 @@ export async function getSightings(opts: {
 export async function countRecentSightings(hours = 24): Promise<number> {
   if (!pool) {
     const cutoff = Date.now() - hours * 3600 * 1000;
-    return memorySightings.filter((s) => new Date(s.reportedAt).getTime() >= cutoff).length;
+    return memorySightingsWithHash.filter(
+      (s) => !s.isShadowBanned && new Date(s.reportedAt).getTime() >= cutoff
+    ).length;
   }
   try {
     const r = await pool.query(
-      `SELECT COUNT(*)::INT AS cnt FROM shelf_sightings WHERE reported_at >= NOW() - ($1 || ' hours')::INTERVAL`,
+      `SELECT COUNT(*)::INT AS cnt
+       FROM shelf_sightings
+       WHERE is_shadow_banned = FALSE
+         AND reported_at >= NOW() - ($1 || ' hours')::INTERVAL`,
       [hours]
     );
     return r.rows[0]?.cnt ?? 0;
@@ -1537,6 +1608,7 @@ export async function getSuburbShortages(hours = 24): Promise<SuburbShortageItem
          MAX(reported_at) AS last_reported
        FROM shelf_sightings
        WHERE reported_at >= NOW() - ($1 || ' hours')::INTERVAL
+         AND is_shadow_banned = FALSE
          AND state IN ('likelyGone', 'runningLow')
        GROUP BY product_id, suburb, retailer
        ORDER BY out_cnt DESC, reporters DESC, last_reported DESC
@@ -1713,5 +1785,345 @@ export async function getCategoryMedians(): Promise<{ formula: number | null; na
     };
   } catch {
     return { formula: null, nappies: null };
+  }
+}
+
+// ─── Apple SEAR Hardware Attestation & Project Zero Deception Persistence ────
+
+export interface AttestedKeyRecord {
+  keyId: string;
+  publicKeyPem: string;
+  attestMode: "app_attest" | "secure_enclave" | "dev_keychain";
+  appAttestCbor?: string;
+  bundleId: string;
+  lastCounter: number;
+  taintMask: number;
+  enrolledIpHash?: string;
+}
+
+const memoryAttestedKeys = new Map<string, AttestedKeyRecord>();
+const memoryShadowBans = new Map<string, { strikes: number; isBanned: boolean; reason: string }>();
+
+export async function upsertAttestedKey(rec: AttestedKeyRecord): Promise<void> {
+  memoryAttestedKeys.set(rec.keyId, rec);
+  if (memoryAttestedKeys.size > 10_000) {
+    const oldest = memoryAttestedKeys.keys().next().value;
+    if (oldest) memoryAttestedKeys.delete(oldest);
+  }
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO attested_keys
+         (key_id, public_key_pem, attest_mode, app_attest_cbor, bundle_id, last_counter, taint_mask, enrolled_ip_hash, enrolled_at, last_seen_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
+       ON CONFLICT (key_id) DO UPDATE SET
+         public_key_pem = EXCLUDED.public_key_pem,
+         attest_mode = EXCLUDED.attest_mode,
+         app_attest_cbor = COALESCE(EXCLUDED.app_attest_cbor, attested_keys.app_attest_cbor),
+         bundle_id = EXCLUDED.bundle_id,
+         taint_mask = GREATEST(attested_keys.taint_mask, EXCLUDED.taint_mask),
+         last_seen_at = NOW()`,
+      [
+        rec.keyId,
+        rec.publicKeyPem,
+        rec.attestMode,
+        rec.appAttestCbor ?? null,
+        rec.bundleId,
+        rec.lastCounter,
+        rec.taintMask,
+        rec.enrolledIpHash ?? null,
+      ]
+    );
+  } catch (err) {
+    console.error("[db] upsertAttestedKey error:", (err as Error).message);
+  }
+}
+
+export async function loadAttestedKey(keyId: string): Promise<AttestedKeyRecord | null> {
+  const cached = memoryAttestedKeys.get(keyId);
+  if (cached) return cached;
+  if (!pool) return null;
+  try {
+    const res = await pool.query(
+      `SELECT key_id, public_key_pem, attest_mode, app_attest_cbor, bundle_id, last_counter, taint_mask, enrolled_ip_hash
+       FROM attested_keys
+       WHERE key_id = $1`,
+      [keyId]
+    );
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    const rec: AttestedKeyRecord = {
+      keyId: String(r.key_id),
+      publicKeyPem: String(r.public_key_pem),
+      attestMode: (r.attest_mode === "app_attest" || r.attest_mode === "dev_keychain"
+        ? r.attest_mode
+        : "secure_enclave") as AttestedKeyRecord["attestMode"],
+      appAttestCbor: r.app_attest_cbor ?? undefined,
+      bundleId: String(r.bundle_id ?? "au.com.bubstock.app"),
+      lastCounter: Number(r.last_counter ?? 0),
+      taintMask: Number(r.taint_mask ?? 0),
+      enrolledIpHash: r.enrolled_ip_hash ?? undefined,
+    };
+    memoryAttestedKeys.set(keyId, rec);
+    return rec;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateAttestedKeyState(
+  keyId: string,
+  highestCounter: number,
+  taintMask: number
+): Promise<void> {
+  const cached = memoryAttestedKeys.get(keyId);
+  if (cached) {
+    cached.lastCounter = Math.max(cached.lastCounter, highestCounter);
+    cached.taintMask = cached.taintMask | taintMask;
+  }
+  if (!pool) return;
+  try {
+    await pool.query(
+      `UPDATE attested_keys
+       SET last_counter = GREATEST(last_counter, $2),
+           taint_mask = (taint_mask | $3),
+           last_seen_at = NOW()
+       WHERE key_id = $1`,
+      [keyId, highestCounter, taintMask]
+    );
+  } catch {
+    // Non-fatal telemetry update
+  }
+}
+
+export async function persistHostileFingerprint(
+  ipHash: string,
+  reason: string,
+  scoreDelta: number
+): Promise<void> {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO hostile_fingerprints (ip_hash, threat_score, reason, hit_count, first_seen_at, last_seen_at, expires_at)
+       VALUES ($1, $2, $3, 1, NOW(), NOW(), NOW() + INTERVAL '7 days')
+       ON CONFLICT (ip_hash) DO UPDATE SET
+         threat_score = LEAST(10000, hostile_fingerprints.threat_score + $2),
+         reason = $3,
+         hit_count = hostile_fingerprints.hit_count + 1,
+         last_seen_at = NOW(),
+         expires_at = NOW() + INTERVAL '7 days'`,
+      [ipHash, scoreDelta, reason.slice(0, 120)]
+    );
+  } catch (err) {
+    console.error("[db] persistHostileFingerprint error:", (err as Error).message);
+  }
+}
+
+export async function loadActiveHostileFingerprints(): Promise<Array<{ ipHash: string; threatScore: number; reason: string; expiresAtMs: number }>> {
+  if (!pool) return [];
+  try {
+    const res = await pool.query(
+      `SELECT ip_hash, threat_score, reason, expires_at
+       FROM hostile_fingerprints
+       WHERE expires_at > NOW()
+       ORDER BY last_seen_at DESC
+       LIMIT 5000`
+    );
+    return res.rows.map((r) => ({
+      ipHash: String(r.ip_hash),
+      threatScore: Number(r.threat_score ?? 100),
+      reason: String(r.reason ?? "hostile"),
+      expiresAtMs: new Date(r.expires_at).getTime(),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export async function logHoneypotHit(
+  ipHash: string,
+  path: string,
+  method: string,
+  userAgent: string,
+  reason: string
+): Promise<void> {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO honeypot_hits (ip_hash, path, method, user_agent, reason)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [ipHash, path.slice(0, 160), method.slice(0, 16), userAgent.slice(0, 180), reason.slice(0, 120)]
+    );
+    // Keep table bounded to last 30 days
+    await pool.query(`DELETE FROM honeypot_hits WHERE created_at < NOW() - INTERVAL '30 days'`).catch(() => {});
+  } catch {
+    // Non-fatal logging
+  }
+}
+
+export async function isDeviceShadowBanned(deviceId?: string): Promise<boolean> {
+  const hash = hashDeviceId(deviceId);
+  if (!hash) return false;
+  const cached = memoryShadowBans.get(hash);
+  if (cached?.isBanned) return true;
+  if (!pool) return false;
+  try {
+    const res = await pool.query(
+      `SELECT strikes, is_banned, reason FROM shadow_banned_devices WHERE device_hash = $1`,
+      [hash]
+    );
+    if (res.rows.length === 0) return false;
+    const row = res.rows[0];
+    memoryShadowBans.set(hash, {
+      strikes: Number(row.strikes ?? 1),
+      isBanned: Boolean(row.is_banned),
+      reason: String(row.reason ?? ""),
+    });
+    return Boolean(row.is_banned);
+  } catch {
+    return false;
+  }
+}
+
+export async function recordDeviceStrike(
+  deviceId: string | undefined,
+  reason: string,
+  forceBan = false
+): Promise<{ strikes: number; isBanned: boolean }> {
+  const hash = hashDeviceId(deviceId);
+  if (!hash) return { strikes: 0, isBanned: forceBan };
+
+  const cur = memoryShadowBans.get(hash) ?? { strikes: 0, isBanned: false, reason };
+  const nextStrikes = cur.strikes + 1;
+  const nextBanned = forceBan || cur.isBanned || nextStrikes >= 2;
+  memoryShadowBans.set(hash, { strikes: nextStrikes, isBanned: nextBanned, reason });
+
+  if (!pool) {
+    return { strikes: nextStrikes, isBanned: nextBanned };
+  }
+  try {
+    const res = await pool.query(
+      `INSERT INTO shadow_banned_devices (device_hash, strikes, is_banned, reason, updated_at)
+       VALUES ($1, 1, $2, $3, NOW())
+       ON CONFLICT (device_hash) DO UPDATE SET
+         strikes = shadow_banned_devices.strikes + 1,
+         is_banned = shadow_banned_devices.is_banned OR $2 OR (shadow_banned_devices.strikes + 1) >= 2,
+         reason = $3,
+         updated_at = NOW()
+       RETURNING strikes, is_banned`,
+      [hash, forceBan, reason.slice(0, 120)]
+    );
+    const strikes = Number(res.rows[0]?.strikes ?? nextStrikes);
+    const isBanned = Boolean(res.rows[0]?.is_banned ?? nextBanned);
+    memoryShadowBans.set(hash, { strikes, isBanned, reason });
+    return { strikes, isBanned };
+  } catch {
+    return { strikes: nextStrikes, isBanned: nextBanned };
+  }
+}
+
+export async function countRecentLikelyGoneByDevice(deviceId?: string, minutes = 10): Promise<number> {
+  const hash = hashDeviceId(deviceId);
+  if (!hash) return 0;
+  if (!pool) {
+    const cutoff = Date.now() - minutes * 60_000;
+    return memorySightingsWithHash.filter(
+      (s) => s.deviceHash === hash && s.state === "likelyGone" && new Date(s.reportedAt).getTime() >= cutoff
+    ).length;
+  }
+  try {
+    const res = await pool.query(
+      `SELECT COUNT(DISTINCT store_id)::INT AS cnt
+       FROM shelf_sightings
+       WHERE device_hash = $1
+         AND state = 'likelyGone'
+         AND reported_at >= NOW() - ($2 || ' minutes')::INTERVAL`,
+      [hash, minutes]
+    );
+    return Number(res.rows[0]?.cnt ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+export async function getSecurityTelemetrySummary(): Promise<{
+  attestedKeys: { total: number; appAttest: number; secureEnclave: number; devKeychain: number; tainted: number };
+  hostileFingerprintsActive: number;
+  honeypotHitsLast24h: number;
+  shadowBannedDevices: number;
+  shadowBannedSightings: number;
+  recentHoneypotHits: Array<{ path: string; method: string; reason: string; createdAt: string }>;
+}> {
+  if (!pool) {
+    let appAttest = 0;
+    let secureEnclave = 0;
+    let devKeychain = 0;
+    let tainted = 0;
+    for (const k of memoryAttestedKeys.values()) {
+      if (k.attestMode === "app_attest") appAttest++;
+      else if (k.attestMode === "secure_enclave") secureEnclave++;
+      else devKeychain++;
+      if (k.taintMask > 0) tainted++;
+    }
+    return {
+      attestedKeys: { total: memoryAttestedKeys.size, appAttest, secureEnclave, devKeychain, tainted },
+      hostileFingerprintsActive: 0,
+      honeypotHitsLast24h: 0,
+      shadowBannedDevices: [...memoryShadowBans.values()].filter((v) => v.isBanned).length,
+      shadowBannedSightings: memorySightingsWithHash.filter((s) => s.isShadowBanned).length,
+      recentHoneypotHits: [],
+    };
+  }
+  try {
+    const [keysRes, hostileRes, hitsCountRes, shadowDevRes, shadowSightRes, recentHitsRes] = await Promise.all([
+      pool.query(
+        `SELECT
+           COUNT(*)::INT AS total,
+           COUNT(*) FILTER (WHERE attest_mode = 'app_attest')::INT AS app_attest,
+           COUNT(*) FILTER (WHERE attest_mode = 'secure_enclave')::INT AS secure_enclave,
+           COUNT(*) FILTER (WHERE attest_mode = 'dev_keychain')::INT AS dev_keychain,
+           COUNT(*) FILTER (WHERE taint_mask > 0)::INT AS tainted
+         FROM attested_keys`
+      ),
+      pool.query(`SELECT COUNT(*)::INT AS cnt FROM hostile_fingerprints WHERE expires_at > NOW()`),
+      pool.query(`SELECT COUNT(*)::INT AS cnt FROM honeypot_hits WHERE created_at >= NOW() - INTERVAL '24 hours'`),
+      pool.query(`SELECT COUNT(*)::INT AS cnt FROM shadow_banned_devices WHERE is_banned = TRUE`),
+      pool.query(`SELECT COUNT(*)::INT AS cnt FROM shelf_sightings WHERE is_shadow_banned = TRUE`),
+      pool.query(
+        `SELECT path, method, reason, created_at
+         FROM honeypot_hits
+         ORDER BY created_at DESC
+         LIMIT 20`
+      ),
+    ]);
+    const kr = keysRes.rows[0] ?? {};
+    return {
+      attestedKeys: {
+        total: Number(kr.total ?? 0),
+        appAttest: Number(kr.app_attest ?? 0),
+        secureEnclave: Number(kr.secure_enclave ?? 0),
+        devKeychain: Number(kr.dev_keychain ?? 0),
+        tainted: Number(kr.tainted ?? 0),
+      },
+      hostileFingerprintsActive: Number(hostileRes.rows[0]?.cnt ?? 0),
+      honeypotHitsLast24h: Number(hitsCountRes.rows[0]?.cnt ?? 0),
+      shadowBannedDevices: Number(shadowDevRes.rows[0]?.cnt ?? 0),
+      shadowBannedSightings: Number(shadowSightRes.rows[0]?.cnt ?? 0),
+      recentHoneypotHits: recentHitsRes.rows.map((r) => ({
+        path: String(r.path),
+        method: String(r.method),
+        reason: String(r.reason),
+        createdAt: new Date(r.created_at).toISOString(),
+      })),
+    };
+  } catch {
+    return {
+      attestedKeys: { total: 0, appAttest: 0, secureEnclave: 0, devKeychain: 0, tainted: 0 },
+      hostileFingerprintsActive: 0,
+      honeypotHitsLast24h: 0,
+      shadowBannedDevices: 0,
+      shadowBannedSightings: 0,
+      recentHoneypotHits: [],
+    };
   }
 }
