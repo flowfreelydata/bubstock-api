@@ -102,7 +102,7 @@ function toEntry(
 
   return {
     retailer: "Coles",
-    storeName: "Coles Online (VIC)",
+    storeName: `Coles Online (${state.toUpperCase()})`,
     suburb,
     state: state.toUpperCase(),
     matchedName: fullName || (item.name ?? "Coles Product"),

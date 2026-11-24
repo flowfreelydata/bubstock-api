@@ -63,6 +63,7 @@ import {
   recordDeviceStrike,
   countRecentLikelyGoneByDevice,
   getSecurityTelemetrySummary,
+  pruneStaleRecords,
   pingDB,
   type PushSubscriptionRecord,
   type RecallRow,
@@ -392,7 +393,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "3.0.0",
+    version: "3.1.0",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
@@ -495,7 +496,7 @@ app.get("/admin/security/summary", async (req: Request, res: Response) => {
   res.setHeader("Cache-Control", "no-store, private");
   res.json({
     service: "bubstock-au-api",
-    version: "3.0.0",
+    version: "3.1.0",
     ...summary,
     generatedAt: new Date().toISOString(),
   });
@@ -1355,24 +1356,29 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
       ? Number(observedPrice.toFixed(2))
       : undefined;
 
-  // Project Zero Shadow-Quarantine: check if this device/IP/binary is already shadow-banned
-  // (Clean hardware-attested iPhones are immune to carrier CGNAT IP spillover)
-  const cleanHardware = Boolean(
-    req.security?.isAttested && !req.security?.isTamperedClient && !req.security?.isReplayAttack && !req.security?.isScraperUa
+  // Project Zero Shadow-Quarantine: check if this device/IP/binary is already shadow-banned.
+  // Only truly Apple-PKI-verified App Attest hardware overrides IP-only hostility;
+  // anonymous poisoners without deviceId fall back to ipHash so Strike-2 quarantine still traps them.
+  const appleVerified = Boolean(
+    req.security?.isAppleHardwareVerified &&
+      !req.security?.isTamperedClient &&
+      !req.security?.isReplayAttack &&
+      !req.security?.isScraperUa
   );
+  const strikeIdentity = cleanDeviceId ?? `ip:${req.security?.ipHash ?? hashIp(req.ip)}`;
   let shadowBan =
     Boolean(
       req.security?.isTamperedClient ||
         req.security?.isScraperUa ||
-        (!cleanHardware && req.security?.isHostile)
+        (!appleVerified && req.security?.isHostile)
     ) ||
-    (await isDeviceShadowBanned(cleanDeviceId));
+    (await isDeviceShadowBanned(strikeIdentity));
 
   // Detect coordinated out-of-stock sabotage bursts (>5 distinct stores marked likelyGone in 10 min)
-  if (!shadowBan && state === "likelyGone" && cleanDeviceId) {
-    const recentOutStores = await countRecentLikelyGoneByDevice(cleanDeviceId, 10);
+  if (!shadowBan && state === "likelyGone") {
+    const recentOutStores = await countRecentLikelyGoneByDevice(strikeIdentity, 10);
     if (recentOutStores >= 5) {
-      await recordDeviceStrike(cleanDeviceId, "likely_gone_sabotage_burst", true);
+      await recordDeviceStrike(strikeIdentity, "likely_gone_sabotage_burst", true);
       shadowBan = true;
       log("warn", "silently shadow-banned sabotage burst device", { storesIn10m: recentOutStores });
     }
@@ -1388,7 +1394,7 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
       const maxAllowed = Number((stats.median * 2.25).toFixed(2));
       if (parsedPrice < minAllowed || parsedPrice > maxAllowed) {
         if (!shadowBan) {
-          const strike = await recordDeviceStrike(cleanDeviceId, "outlier_price_poisoning");
+          const strike = await recordDeviceStrike(strikeIdentity, "outlier_price_poisoning");
           if (strike.isBanned) {
             shadowBan = true;
             log("warn", "silently shadow-banned repeat price poisoner", {
@@ -1426,7 +1432,7 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
     state,
     observedPrice: parsedPrice,
     note: sanitizeText(note, 240) || undefined,
-    deviceId: cleanDeviceId,
+    deviceId: strikeIdentity,
     isShadowBanned: shadowBan,
   });
 
@@ -1482,17 +1488,32 @@ app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => 
     return;
   }
 
-  // Fast live reachability check: reject blatantly nonexistent 404/410 links while tolerating 403/302 bot gates
+  // SSRF-safe live reachability check: NEVER follow arbitrary redirects (blocks redirect-to-internal SSRF)
   try {
     const probe = await fetch(parsed.toString(), {
       method: "HEAD",
-      redirect: "follow",
+      redirect: "manual",
       signal: AbortSignal.timeout(4_000),
       headers: { "User-Agent": "Mozilla/5.0 (compatible; BubstockLinkCheck/1.0)" },
     });
     if (probe.status === 404 || probe.status === 410) {
       res.status(400).json({ error: "That post link returned 404 (not found). Make sure your post is public and try again." });
       return;
+    }
+    if (probe.status >= 300 && probe.status < 400) {
+      const loc = probe.headers.get("location");
+      if (loc) {
+        try {
+          const redir = new URL(loc, parsed.toString());
+          if (redir.protocol !== "https:" || !ALLOWED_SOCIAL_HOST_RE.test(redir.hostname)) {
+            res.status(400).json({ error: "Social post link redirected to an unsupported host." });
+            return;
+          }
+        } catch {
+          res.status(400).json({ error: "Invalid social post redirect target." });
+          return;
+        }
+      }
     }
   } catch {
     // Tolerate social platform network timeouts gracefully
@@ -1639,7 +1660,9 @@ function matchDropsForSubscription(
     .slice(0, 5);
 }
 
-app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
+const VALID_DEVICE_ID_RE = /^[a-zA-Z0-9-]{16,80}$/;
+
+app.post("/alerts/sync", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
   const {
     deviceId,
     apnsToken,
@@ -1654,13 +1677,13 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
   } = req.body ?? {};
 
   const cleanDeviceId = sanitizeText(deviceId, 80);
-  if (cleanDeviceId.length < 8) {
-    res.status(400).json({ error: "Valid deviceId required" });
+  if (!VALID_DEVICE_ID_RE.test(cleanDeviceId)) {
+    res.status(400).json({ error: "Valid UUID/deviceId required" });
     return;
   }
 
   // Zero-Trust server-side entitlement verification: cryptographically verify StoreKit 2 ES256 JWS
-  // (X.509 Apple chain + ECDSA P-256 signature) OR verified Postgres preview claim.
+  // (Pinned Apple Root CA - G3/G2 chain + ECDSA P-256 signature) OR verified Postgres preview claim.
   const verifiedStoreKit = verifyStoreKitJwsCrypto(storekitJws ?? req.headers["x-bubstock-receipt"]).valid;
   const verifiedPreview = !verifiedStoreKit && hasPlus
     ? await hasDeviceVerifiedPromoOrReferral(cleanDeviceId)
@@ -1688,8 +1711,10 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
       })
     : [];
 
-  await upsertPushSubscription({
+  const callerKeyId = req.security?.isAttested ? req.security.keyId : undefined;
+  const saved = await upsertPushSubscription({
     deviceId: cleanDeviceId,
+    ownerKeyId: callerKeyId,
     apnsToken: cleanToken,
     city: sanitizeText(city, 30) || "melbourne",
     state: cleanState,
@@ -1700,6 +1725,11 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
     watchedRules: cleanRules,
   });
 
+  if (saved.forbidden) {
+    res.status(403).json({ error: "Forbidden — device alert profile belongs to a different hardware key" });
+    return;
+  }
+
   res.status(200).json({
     synced: true,
     verifiedPlus: effectiveHasPlus,
@@ -1708,16 +1738,23 @@ app.post("/alerts/sync", sightingLimit, async (req: Request, res: Response) => {
   });
 });
 
-app.get("/alerts/check", async (req: Request, res: Response) => {
+app.get("/alerts/check", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
   const deviceId = sanitizeText(req.query.deviceId, 80);
-  if (deviceId.length < 8) {
-    res.status(400).json({ error: "deviceId required" });
+  if (!VALID_DEVICE_ID_RE.test(deviceId)) {
+    res.status(400).json({ error: "Valid deviceId required" });
     return;
   }
 
   const sub = await getPushSubscription(deviceId);
   if (!sub) {
     res.json({ alerts: [], count: 0 });
+    return;
+  }
+
+  // Prevent IDOR: if bound to a hardware key, reject mismatched/unattested callers
+  const callerKeyId = req.security?.isAttested ? req.security.keyId : undefined;
+  if (sub.ownerKeyId && callerKeyId !== sub.ownerKeyId) {
+    res.status(403).json({ error: "Forbidden — hardware key mismatch" });
     return;
   }
 
@@ -1851,20 +1888,24 @@ app.get("/household/sync/:vaultId", strictBotGuard, vaultReadLimit, async (req: 
 
 // ─── Server-Verified Referral Codes ──────────────────────────────────────────
 
-app.post("/referrals/register", sightingLimit, async (req: Request, res: Response) => {
+app.post("/referrals/register", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
   const code = sanitizeText(req.body?.code, 12);
   const deviceId = sanitizeText(req.body?.deviceId, 80);
-  if (code.length !== 6 || deviceId.length < 6) {
-    res.status(400).json({ error: "Valid 6-char code and deviceId required" });
+  if (code.length !== 6 || !VALID_DEVICE_ID_RE.test(deviceId)) {
+    res.status(400).json({ error: "Valid 6-char code and UUID deviceId required" });
     return;
   }
   await registerReferralCode(code, deviceId);
   res.status(200).json({ registered: true });
 });
 
-app.post("/referrals/redeem", sightingLimit, async (req: Request, res: Response) => {
+app.post("/referrals/redeem", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
   const code = sanitizeText(req.body?.code, 12);
   const deviceId = sanitizeText(req.body?.deviceId, 80);
+  if (!VALID_DEVICE_ID_RE.test(deviceId)) {
+    res.status(400).json({ accepted: false, monthsGranted: 0, message: "Valid deviceId required." });
+    return;
+  }
   const result = await redeemReferralCode(code, deviceId);
   res.status(result.status).json({
     accepted: result.accepted,
@@ -1875,23 +1916,23 @@ app.post("/referrals/redeem", sightingLimit, async (req: Request, res: Response)
 
 // ─── Mothers' Group / Playgroup Syndicate (Sybil-Resistant 3-Family Loop) ────
 
-app.post("/groups/create", sightingLimit, async (req: Request, res: Response) => {
+app.post("/groups/create", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
   const suburb = sanitizeText(req.body?.suburb, 60) || "Melbourne";
   const city = sanitizeText(req.body?.city, 40) || "Melbourne";
   const deviceId = sanitizeText(req.body?.deviceId, 80);
-  if (deviceId.length < 6) {
-    res.status(400).json({ error: "deviceId required" });
+  if (!VALID_DEVICE_ID_RE.test(deviceId)) {
+    res.status(400).json({ error: "Valid UUID deviceId required" });
     return;
   }
   const status = await createMothersGroup(suburb, city, deviceId, req.ip);
   res.status(201).json(status);
 });
 
-app.post("/groups/join", sightingLimit, async (req: Request, res: Response) => {
+app.post("/groups/join", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
   const groupCode = sanitizeText(req.body?.groupCode, 16);
   const deviceId = sanitizeText(req.body?.deviceId, 80);
-  if (groupCode.length < 4 || deviceId.length < 6) {
-    res.status(400).json({ error: "Valid groupCode and deviceId required" });
+  if (groupCode.length < 4 || !VALID_DEVICE_ID_RE.test(deviceId)) {
+    res.status(400).json({ error: "Valid groupCode and UUID deviceId required" });
     return;
   }
   const result = await joinMothersGroup(groupCode, deviceId, req.ip);
@@ -1939,47 +1980,61 @@ app.get("/shrinkflation", antiLeechGuard, dataDumpLimit, async (req: Request, re
   });
 });
 
-// ─── Australian Baby Cost-of-Living Index (JSON + Press SSR HTML) & SEO Pages
+// ─── Australian Baby Cost-of-Living Index (Cached 5m + Press SSR HTML) & SEO Pages
 
-async function buildCostIndexData(): Promise<{
+type CostIndexBundle = {
   index: BabyCostIndexData;
   gaps: Awaited<ReturnType<typeof getColesVsWoolworthsGaps>>;
   recalls: RecallEntry[];
-}> {
-  const [specials, gaps, { recalls }, sightings24h, shrinkAlerts, medians] = await Promise.all([
-    loadLiveSpecials(),
-    singleflight("compare:gaps", () => getColesVsWoolworthsGaps(72)),
-    getRecallsList(),
-    countRecentSightings(24),
-    detectShrinkflation(),
-    getCategoryMedians(),
-  ]);
+};
 
-  const halfPrice = specials.filter((s) => s.savingsPercent >= 40).length;
-  const nonZeroGaps = gaps.filter((g) => g.savingsAmount >= 0.1);
-  const avgGap =
-    nonZeroGaps.length > 0
-      ? Number((nonZeroGaps.reduce((acc, g) => acc + g.savingsAmount, 0) / nonZeroGaps.length).toFixed(2))
-      : 0;
-  const biggestGap = nonZeroGaps[0]?.savingsAmount ?? 0;
+let costIndexCacheEntry: { data: CostIndexBundle; expiresAt: number } | null = null;
 
-  return {
-    index: {
-      generatedAt: new Date().toISOString(),
-      region: "Australia (VIC, NSW, QLD, WA, SA, TAS)",
-      liveSpecialsCount: specials.length,
-      halfPriceDealsCount: halfPrice,
-      averageColesVsWooliesGapAUD: avgGap,
-      biggestGapAUD: biggestGap,
-      medianFormulaPriceAUD: medians.formula,
-      medianNappiesPriceAUD: medians.nappies,
-      activeRecallsCount: recalls.length,
-      shrinkflationAlertsCount: shrinkAlerts.length,
-      sightingsLast24h: sightings24h,
-    },
-    gaps,
-    recalls,
-  };
+async function buildCostIndexData(): Promise<CostIndexBundle> {
+  if (costIndexCacheEntry && Date.now() < costIndexCacheEntry.expiresAt) {
+    return costIndexCacheEntry.data;
+  }
+  return singleflight("cost:index:au", async () => {
+    if (costIndexCacheEntry && Date.now() < costIndexCacheEntry.expiresAt) {
+      return costIndexCacheEntry.data;
+    }
+    const [specials, gaps, { recalls }, sightings24h, shrinkAlerts, medians] = await Promise.all([
+      loadLiveSpecials(),
+      singleflight("compare:gaps", () => getColesVsWoolworthsGaps(72)),
+      getRecallsList(),
+      countRecentSightings(24),
+      detectShrinkflation(),
+      getCategoryMedians(),
+    ]);
+
+    const halfPrice = specials.filter((s) => s.savingsPercent >= 40).length;
+    const nonZeroGaps = gaps.filter((g) => g.savingsAmount >= 0.1);
+    const avgGap =
+      nonZeroGaps.length > 0
+        ? Number((nonZeroGaps.reduce((acc, g) => acc + g.savingsAmount, 0) / nonZeroGaps.length).toFixed(2))
+        : 0;
+    const biggestGap = nonZeroGaps[0]?.savingsAmount ?? 0;
+
+    const bundle: CostIndexBundle = {
+      index: {
+        generatedAt: new Date().toISOString(),
+        region: "Australia (VIC, NSW, QLD, WA, SA, TAS)",
+        liveSpecialsCount: specials.length,
+        halfPriceDealsCount: halfPrice,
+        averageColesVsWooliesGapAUD: avgGap,
+        biggestGapAUD: biggestGap,
+        medianFormulaPriceAUD: medians.formula,
+        medianNappiesPriceAUD: medians.nappies,
+        activeRecallsCount: recalls.length,
+        shrinkflationAlertsCount: shrinkAlerts.length,
+        sightingsLast24h: sightings24h,
+      },
+      gaps,
+      recalls,
+    };
+    costIndexCacheEntry = { data: bundle, expiresAt: Date.now() + 5 * 60 * 1000 };
+    return bundle;
+  });
 }
 
 app.get("/index/au", antiLeechGuard, dataDumpLimit, async (_req: Request, res: Response) => {
@@ -1988,14 +2043,14 @@ app.get("/index/au", antiLeechGuard, dataDumpLimit, async (_req: Request, res: R
   res.json(index);
 });
 
-app.get("/au/index", async (_req: Request, res: Response) => {
+app.get("/au/index", dataDumpLimit, async (_req: Request, res: Response) => {
   const { index, gaps, recalls } = await buildCostIndexData();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
   res.send(renderCostIndexPage(index, gaps, recalls));
 });
 
-app.get("/au/half-price-baby-deals", async (_req: Request, res: Response) => {
+app.get("/au/half-price-baby-deals", dataDumpLimit, async (_req: Request, res: Response) => {
   const specials = await loadLiveSpecials();
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
@@ -2078,12 +2133,15 @@ cron.schedule("0 3 * * *", async () => {
   await Promise.all(ALL_CITIES.map((c) => loadCityStores(c))).catch((e) =>
     log("error", "cron stores failed", { err: (e as Error).message })
   );
+  await pruneStaleRecords().catch((e) =>
+    log("error", "cron pruneStaleRecords failed", { err: (e as Error).message })
+  );
 });
 
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "3.0.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "3.1.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

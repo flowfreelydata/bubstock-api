@@ -171,6 +171,7 @@ export async function initSchema(): Promise<void> {
 
       CREATE TABLE IF NOT EXISTS push_subscriptions (
         device_id            TEXT PRIMARY KEY,
+        owner_key_id         TEXT,
         apns_token           TEXT,
         city                 TEXT NOT NULL DEFAULT 'melbourne',
         state                TEXT NOT NULL DEFAULT 'VIC',
@@ -181,6 +182,8 @@ export async function initSchema(): Promise<void> {
         watched_rules        JSONB NOT NULL DEFAULT '[]'::jsonb,
         updated_at           TIMESTAMPTZ DEFAULT NOW()
       );
+
+      ALTER TABLE push_subscriptions ADD COLUMN IF NOT EXISTS owner_key_id TEXT;
 
       CREATE TABLE IF NOT EXISTS sent_push_alerts (
         device_id  TEXT NOT NULL,
@@ -396,7 +399,7 @@ export async function getColesVsWoolworthsGaps(maxAgeHours = 48): Promise<PriceG
     const result = await pool.query(
       `SELECT DISTINCT ON (lower(product_name), retailer, COALESCE(stockcode, lower(matched_name)))
          lower(product_name) AS product_key,
-         retailer,
+         retailer, suburb, state,
          price::FLOAT8 AS price,
          was_price::FLOAT8 AS was_price,
          unit, is_on_sale, is_in_stock, matched_name, stockcode, image_url, product_url, fetched_at
@@ -412,11 +415,12 @@ export async function getColesVsWoolworthsGaps(maxAgeHours = 48): Promise<PriceG
     for (const r of result.rows) {
       const key = String(r.product_key);
       const bucket = grouped.get(key) ?? { wow: [], coles: [] };
+      const st = String(r.state ?? "VIC").toUpperCase();
       const entry: PriceEntry = {
         retailer: r.retailer,
-        storeName: `${r.retailer} VIC`,
-        suburb: "Melbourne",
-        state: "VIC",
+        storeName: `${r.retailer} ${st}`,
+        suburb: String(r.suburb ?? "Melbourne"),
+        state: st,
         matchedName: r.matched_name ?? key,
         stockcode: r.stockcode ?? undefined,
         price: Number(r.price),
@@ -1092,6 +1096,7 @@ export interface WatchedAlertRule {
 
 export interface PushSubscriptionRecord {
   deviceId: string;
+  ownerKeyId?: string;
   apnsToken?: string;
   city: string;
   state: string;
@@ -1106,20 +1111,40 @@ export interface PushSubscriptionRecord {
 const memoryPushSubs = new Map<string, PushSubscriptionRecord>();
 const memorySentKeys = new Set<string>();
 
-export async function upsertPushSubscription(sub: Omit<PushSubscriptionRecord, "updatedAt">): Promise<void> {
+export async function upsertPushSubscription(
+  sub: Omit<PushSubscriptionRecord, "updatedAt">
+): Promise<{ ok: boolean; forbidden?: boolean }> {
   const updatedAt = new Date().toISOString();
-  const full: PushSubscriptionRecord = { ...sub, updatedAt };
 
   if (!pool) {
+    const existing = memoryPushSubs.get(sub.deviceId);
+    if (existing?.ownerKeyId && sub.ownerKeyId && existing.ownerKeyId !== sub.ownerKeyId) {
+      return { ok: false, forbidden: true };
+    }
+    const full: PushSubscriptionRecord = {
+      ...sub,
+      ownerKeyId: existing?.ownerKeyId ?? sub.ownerKeyId,
+      updatedAt,
+    };
     memoryPushSubs.set(sub.deviceId, full);
-    return;
+    return { ok: true };
+  }
+
+  const existing = await pool.query(
+    `SELECT owner_key_id FROM push_subscriptions WHERE device_id = $1`,
+    [sub.deviceId]
+  );
+  const storedOwner = existing.rows[0]?.owner_key_id ? String(existing.rows[0].owner_key_id) : undefined;
+  if (storedOwner && sub.ownerKeyId && storedOwner !== sub.ownerKeyId) {
+    return { ok: false, forbidden: true };
   }
 
   await pool.query(
     `INSERT INTO push_subscriptions
-       (device_id, apns_token, city, state, has_plus, half_price_enabled, min_discount_percent, alert_categories, watched_rules, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10)
+       (device_id, owner_key_id, apns_token, city, state, has_plus, half_price_enabled, min_discount_percent, alert_categories, watched_rules, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
      ON CONFLICT (device_id) DO UPDATE SET
+       owner_key_id         = COALESCE(push_subscriptions.owner_key_id, EXCLUDED.owner_key_id),
        apns_token           = COALESCE(EXCLUDED.apns_token, push_subscriptions.apns_token),
        city                 = EXCLUDED.city,
        state                = EXCLUDED.state,
@@ -1131,6 +1156,7 @@ export async function upsertPushSubscription(sub: Omit<PushSubscriptionRecord, "
        updated_at           = EXCLUDED.updated_at`,
     [
       sub.deviceId,
+      sub.ownerKeyId ?? null,
       sub.apnsToken ?? null,
       sub.city,
       sub.state,
@@ -1142,12 +1168,13 @@ export async function upsertPushSubscription(sub: Omit<PushSubscriptionRecord, "
       updatedAt,
     ]
   );
+  return { ok: true };
 }
 
 export async function getPushSubscription(deviceId: string): Promise<PushSubscriptionRecord | null> {
   if (!pool) return memoryPushSubs.get(deviceId) ?? null;
   const r = await pool.query(
-    `SELECT device_id, apns_token, city, state, has_plus, half_price_enabled,
+    `SELECT device_id, owner_key_id, apns_token, city, state, has_plus, half_price_enabled,
             min_discount_percent, alert_categories, watched_rules, updated_at
      FROM push_subscriptions WHERE device_id = $1`,
     [deviceId]
@@ -1156,6 +1183,7 @@ export async function getPushSubscription(deviceId: string): Promise<PushSubscri
   if (!row) return null;
   return {
     deviceId: row.device_id,
+    ownerKeyId: row.owner_key_id ?? undefined,
     apnsToken: row.apns_token ?? undefined,
     city: row.city,
     state: row.state,
@@ -2125,5 +2153,19 @@ export async function getSecurityTelemetrySummary(): Promise<{
       shadowBannedSightings: 0,
       recentHoneypotHits: [],
     };
+  }
+}
+
+export async function pruneStaleRecords(): Promise<void> {
+  if (!pool) return;
+  try {
+    await Promise.all([
+      pool.query(`DELETE FROM sent_push_alerts WHERE sent_at < NOW() - INTERVAL '30 days'`),
+      pool.query(`DELETE FROM price_entries WHERE fetched_at < NOW() - INTERVAL '370 days'`),
+      pool.query(`DELETE FROM hostile_fingerprints WHERE expires_at < NOW()`),
+      pool.query(`DELETE FROM honeypot_hits WHERE created_at < NOW() - INTERVAL '30 days'`),
+    ]);
+  } catch (err) {
+    console.error("[db] pruneStaleRecords error:", (err as Error).message);
   }
 }

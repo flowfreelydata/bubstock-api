@@ -15,11 +15,42 @@ const P256_SPKI_PREFIX = Buffer.from(
   "hex"
 );
 
+// Official Apple PKI Root CA SHA-256 fingerprints (apple.com/certificateauthority)
+const PINNED_APPLE_STOREKIT_ROOT_FINGERPRINTS = new Set<string>([
+  // Apple Root CA - G3 (Primary ECDSA-384 root for StoreKit 2 JWS x5c chains)
+  "63:34:3A:BF:B8:9A:6A:03:EB:B5:7E:9B:3F:5F:A7:BE:7C:4F:5C:75:6F:30:17:B3:A8:C4:88:C3:65:3E:91:79",
+  // Apple Root CA - G2 (Secondary RSA-4096 root)
+  "C2:B9:B0:42:DD:57:83:0E:7D:11:7D:AC:55:AC:8A:E1:94:07:D3:8E:41:D8:8F:32:15:BC:3A:89:04:44:A0:50",
+]);
+
+// Official Apple App Attestation Root CA PEM (SHA-256: 1C:B9:82:3B:...:42:C9:32)
+const APPLE_APP_ATTEST_ROOT_CA_PEM = `-----BEGIN CERTIFICATE-----
+MIICITCCAaegAwIBAgIQC/O+DvHN0uD7jG5yH2IXmDAKBggqhkjOPQQDAzBSMSYw
+JAYDVQQDDB1BcHBsZSBBcHAgQXR0ZXN0YXRpb24gUm9vdCBDQTETMBEGA1UECgwK
+QXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTAeFw0yMDAzMTgxODMyNTNa
+Fw00NTAzMTUwMDAwMDBaMFIxJjAkBgNVBAMMHUFwcGxlIEFwcCBBdHRlc3RhdGlv
+biBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJbmMuMRMwEQYDVQQIDApDYWxpZm9y
+bmlhMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAERTHhmLW07ATaFQIEVwTtT4dyctdh
+NbJhFs/Ii2FdCgAHGbpphY3+d8qjuDngIN3WVhQUBHAoMeQ/cLiP1sOUtgjqK9au
+Yen1mMEvRq9Sk3Jm5X8U62H+xTD3FE9TgS41o0IwQDAPBgNVHRMBAf8EBTADAQH/
+MB0GA1UdDgQWBBSskRBTM72+aEH/pwyp5frq5eWKoTAOBgNVHQ8BAf8EBAMCAQYw
+CgYIKoZIzj0EAwMDaAAwZQIwQgFGnByvsiVbpTKwSga0kP0e8EeDS4+sQmTvb7vn
+53O5+FRXgeLhpJ06ysC5PrOyAjEAp5U4xDgEgllF7En3VcE3iexZZtKeYnpqtijV
+oyFraWVIyd/dganmrduC1bmTBGwD
+-----END CERTIFICATE-----`;
+
+const APPLE_APP_ATTEST_ROOT_CA = new crypto.X509Certificate(APPLE_APP_ATTEST_ROOT_CA_PEM);
+// ASN.1 DER encoding of Apple App Attest Nonce Extension OID 1.2.840.113635.100.8.2
+const APPLE_ATTEST_NONCE_OID_DER = Buffer.from("06092a864886f763640802", "hex");
+
 const MAX_CHALLENGES = 5_000;
 const CHALLENGE_TTL_MS = 120_000;
 const TIMESTAMP_DRIFT_MS = 120_000;
 const MAX_NONCE_CACHE = 25_000;
 const REPLAY_WINDOW_SIZE = 64;
+const UNATTESTED_VELOCITY_WINDOW_MS = 60_000;
+const UNATTESTED_VELOCITY_LIMIT = 14;
+const MAX_VELOCITY_TRACKERS = 5_000;
 
 const SCRAPER_BOT_UA_RE =
   /\b(python-requests|python-urllib|scrapy|aiohttp|httpx|go-http-client|wget|libwww-perl|java\/|okhttp|axios\/|node-fetch|puppeteer|playwright|selenium|headlesschrome)\b/i;
@@ -27,6 +58,7 @@ const SCRAPER_BOT_UA_RE =
 export interface RequestSecurityContext {
   ipHash: string;
   isAttested: boolean;
+  isAppleHardwareVerified: boolean;
   attestMode: "app_attest" | "secure_enclave" | "dev_keychain" | "none";
   keyId?: string;
   isScraperUa: boolean;
@@ -55,6 +87,166 @@ const seenNonces = new Map<string, number>();
 
 // RFC 4303 64-slot sliding replay window per hardware keyId
 const counterWindows = new Map<string, { highest: number; seen: Set<number> }>();
+
+// Behavioral velocity tracker for unattested clients scraping distinct products
+const unattestedVelocity = new Map<string, { windowStartMs: number; keys: Set<string> }>();
+
+// ─── Minimal Zero-Dependency RFC 8949 CBOR Decoder (for Apple App Attest) ───
+
+function decodeCbor(buf: Buffer): unknown {
+  let offset = 0;
+
+  function readUint(addl: number): number {
+    if (addl < 24) return addl;
+    if (addl === 24) {
+      if (offset + 1 > buf.length) throw new Error("cbor_eof");
+      return buf[offset++];
+    }
+    if (addl === 25) {
+      if (offset + 2 > buf.length) throw new Error("cbor_eof");
+      const v = buf.readUInt16BE(offset);
+      offset += 2;
+      return v;
+    }
+    if (addl === 26) {
+      if (offset + 4 > buf.length) throw new Error("cbor_eof");
+      const v = buf.readUInt32BE(offset);
+      offset += 4;
+      return v;
+    }
+    throw new Error("cbor_unsupported_len");
+  }
+
+  function parseValue(depth: number): unknown {
+    if (depth > 8 || offset >= buf.length) throw new Error("cbor_depth_or_eof");
+    const initial = buf[offset++];
+    const major = initial >> 5;
+    const addl = initial & 0x1f;
+
+    switch (major) {
+      case 0:
+        return readUint(addl);
+      case 1:
+        return -1 - readUint(addl);
+      case 2: {
+        const len = readUint(addl);
+        if (offset + len > buf.length) throw new Error("cbor_bytes_eof");
+        const slice = buf.subarray(offset, offset + len);
+        offset += len;
+        return Buffer.from(slice);
+      }
+      case 3: {
+        const len = readUint(addl);
+        if (offset + len > buf.length) throw new Error("cbor_text_eof");
+        const str = buf.subarray(offset, offset + len).toString("utf8");
+        offset += len;
+        return str;
+      }
+      case 4: {
+        const len = readUint(addl);
+        if (len > 128) throw new Error("cbor_array_too_large");
+        const arr: unknown[] = [];
+        for (let i = 0; i < len; i++) arr.push(parseValue(depth + 1));
+        return arr;
+      }
+      case 5: {
+        const len = readUint(addl);
+        if (len > 128) throw new Error("cbor_map_too_large");
+        const obj: Record<string, unknown> = {};
+        for (let i = 0; i < len; i++) {
+          const k = String(parseValue(depth + 1));
+          obj[k] = parseValue(depth + 1);
+        }
+        return obj;
+      }
+      case 7:
+        if (addl === 20) return false;
+        if (addl === 21) return true;
+        if (addl === 22 || addl === 23) return null;
+        throw new Error("cbor_simple_unsupported");
+      default:
+        throw new Error("cbor_major_unsupported");
+    }
+  }
+
+  return parseValue(0);
+}
+
+/**
+ * Cryptographically verifies an Apple `DCAppAttestService` CBOR attestation object:
+ * 1. Decodes CBOR map (`fmt === "apple-appattest"`, `attStmt.x5c[]`, `authData`).
+ * 2. Verifies `credCert -> intermediateCert -> pinned APPLE_APP_ATTEST_ROOT_CA`.
+ * 3. Verifies certificate validity windows.
+ * 4. Verifies Apple App Attest Nonce OID `1.2.840.113635.100.8.2` embeds `SHA256(authData || SHA256(challenge))`.
+ * 5. When `APPLE_TEAM_ID` is configured, verifies `authData[0..32]` equals `SHA256("<TEAM_ID>.au.com.bubstock.app")`.
+ */
+export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string): boolean {
+  if (typeof cborB64 !== "string" || cborB64.length < 120 || cborB64.length > 16_000) return false;
+  try {
+    const raw = Buffer.from(cborB64, "base64");
+    const decoded = decodeCbor(raw) as {
+      fmt?: unknown;
+      attStmt?: { x5c?: unknown[] };
+      authData?: unknown;
+    };
+    if (!decoded || decoded.fmt !== "apple-appattest") return false;
+    if (!Buffer.isBuffer(decoded.authData) || decoded.authData.length < 37) return false;
+    const x5c = decoded.attStmt?.x5c;
+    if (!Array.isArray(x5c) || x5c.length < 2) return false;
+
+    const certs: crypto.X509Certificate[] = [];
+    for (const item of x5c.slice(0, 4)) {
+      if (!Buffer.isBuffer(item) || item.length < 100) return false;
+      certs.push(new crypto.X509Certificate(item));
+    }
+
+    const now = Date.now();
+    for (const cert of certs) {
+      if (new Date(cert.validFrom).getTime() > now || new Date(cert.validTo).getTime() < now) {
+        return false;
+      }
+    }
+
+    // Verify full chain up to our pinned Apple App Attestation Root CA public key
+    for (let i = 0; i < certs.length - 1; i++) {
+      if (!certs[i].verify(certs[i + 1].publicKey)) return false;
+    }
+    const top = certs[certs.length - 1];
+    const chainsToPinnedAppleRoot =
+      top.fingerprint256.toUpperCase() === APPLE_APP_ATTEST_ROOT_CA.fingerprint256.toUpperCase() ||
+      top.verify(APPLE_APP_ATTEST_ROOT_CA.publicKey);
+    if (!chainsToPinnedAppleRoot) return false;
+
+    // Verify Apple App Attest Nonce extension: SHA256(authData || SHA256(challenge))
+    const clientDataHash = crypto.createHash("sha256").update(challenge, "utf8").digest();
+    const expectedNonce = crypto
+      .createHash("sha256")
+      .update(Buffer.concat([decoded.authData, clientDataHash]))
+      .digest();
+
+    const credRaw = certs[0].raw;
+    const oidPos = credRaw.indexOf(APPLE_ATTEST_NONCE_OID_DER);
+    if (oidPos === -1) return false;
+    // The 32-byte nonce octet string follows directly inside the extension envelope after the OID
+    const extWindow = credRaw.subarray(oidPos, Math.min(credRaw.length, oidPos + 96));
+    if (extWindow.indexOf(expectedNonce) === -1) return false;
+
+    // Optional strict App ID hash check once APPLE_TEAM_ID is configured in Railway
+    const teamId = process.env.APPLE_TEAM_ID?.trim();
+    if (teamId) {
+      const expectedRpHash = crypto
+        .createHash("sha256")
+        .update(`${teamId}.au.com.bubstock.app`, "utf8")
+        .digest();
+      const actualRpHash = decoded.authData.subarray(0, 32);
+      if (!crypto.timingSafeEqual(expectedRpHash, actualRpHash)) return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function issueAttestChallenge(ipHash: string): { challenge: string; expiresInSeconds: number } {
   const now = Date.now();
@@ -103,25 +295,6 @@ function verifyP256Signature(publicKeyPem: string, message: Buffer, sigBuf: Buff
   }
 }
 
-function validateAppAttestObject(cborB64: unknown): boolean {
-  if (typeof cborB64 !== "string" || cborB64.length < 120 || cborB64.length > 16_000) return false;
-  try {
-    const buf = Buffer.from(cborB64, "base64");
-    if (buf.length < 100) return false;
-    // Apple App Attest CBOR attestation objects contain the ASCII format tag "apple-appattest"
-    // and an "attStmt" map holding the "x5c" Apple hardware certificate chain + "authData".
-    const ascii = buf.toString("latin1");
-    return (
-      ascii.includes("apple-appattest") &&
-      ascii.includes("attStmt") &&
-      ascii.includes("authData") &&
-      ascii.includes("x5c")
-    );
-  } catch {
-    return false;
-  }
-}
-
 export async function enrollHardwareKey(params: {
   keyId: unknown;
   publicKeyB64: unknown;
@@ -164,7 +337,7 @@ export async function enrollHardwareKey(params: {
     return { ok: false, status: 403, error: "Hardware challenge signature verification failed" };
   }
 
-  const hasValidAppleAttest = validateAppAttestObject(params.appAttestObjectB64);
+  const hasValidAppleAttest = verifyAppleAppAttestCbor(params.appAttestObjectB64, challenge);
   const rawMode = typeof params.attestMode === "string" ? params.attestMode : "secure_enclave";
   const attestMode: AttestedKeyRecord["attestMode"] = hasValidAppleAttest
     ? "app_attest"
@@ -239,6 +412,30 @@ function checkAndRecordNonce(keyId: string, nonce: string): boolean {
   return true;
 }
 
+function checkUnattestedScraperVelocity(ipHash: string, req: Request): boolean {
+  if (
+    req.path !== "/prices" &&
+    req.path !== "/compare" &&
+    req.path !== "/specials" &&
+    req.path !== "/compare/gaps"
+  ) {
+    return false;
+  }
+  const now = Date.now();
+  const targetKey = `${req.path}:${String(req.query.product ?? req.query.category ?? "all").toLowerCase().slice(0, 48)}`;
+  let tracker = unattestedVelocity.get(ipHash);
+  if (!tracker || now - tracker.windowStartMs > UNATTESTED_VELOCITY_WINDOW_MS) {
+    if (unattestedVelocity.size >= MAX_VELOCITY_TRACKERS && !unattestedVelocity.has(ipHash)) {
+      const oldest = unattestedVelocity.keys().next().value;
+      if (oldest) unattestedVelocity.delete(oldest);
+    }
+    tracker = { windowStartMs: now, keys: new Set<string>() };
+    unattestedVelocity.set(ipHash, tracker);
+  }
+  tracker.keys.add(targetKey);
+  return tracker.keys.size > UNATTESTED_VELOCITY_LIMIT;
+}
+
 function expectedIntegrityToken(keyId: string, kind: "ok" | "tainted", nonce: string, counter: number): string {
   return crypto
     .createHmac("sha256", keyId)
@@ -256,7 +453,7 @@ function timingSafeHexEqual(a: string, b: string): boolean {
 
 export async function securityContextMiddleware(
   req: Request,
-  _res: Response,
+  res: Response,
   next: NextFunction
 ): Promise<void> {
   const ipHash = hashIp(req.ip);
@@ -267,6 +464,7 @@ export async function securityContextMiddleware(
   const ctx: RequestSecurityContext = {
     ipHash,
     isAttested: false,
+    isAppleHardwareVerified: false,
     attestMode: "none",
     isScraperUa,
     isHostile: isHostileIp(ipHash),
@@ -300,7 +498,10 @@ export async function securityContextMiddleware(
       markHostileIp(ipHash, "replay_duplicate_nonce", 90, { path: req.path, method: req.method, userAgent: ua });
     } else {
       const rec = await loadAttestedKey(keyId);
-      if (rec) {
+      if (!rec) {
+        // Key unknown on server (e.g. fresh DB or env switch) — hint legitimate iOS client to re-enroll cleanly
+        res.setHeader("X-Bubstock-Reenroll", "1");
+      } else {
         const bodyHash = crypto
           .createHash("sha256")
           .update(req.rawBody ?? Buffer.alloc(0))
@@ -328,9 +529,10 @@ export async function securityContextMiddleware(
             userAgent: ua,
           });
         } else {
-          // Valid hardware-signed request! Now silently inspect SEAR runtime integrity bit
+          // Valid signed request! Now silently inspect SEAR runtime integrity bit
           ctx.isAttested = true;
           ctx.attestMode = rec.attestMode;
+          ctx.isAppleHardwareVerified = rec.attestMode === "app_attest";
           ctx.keyId = keyId;
 
           const taintedExpected = expectedIntegrityToken(keyId, "tainted", nonce, counter);
@@ -362,16 +564,23 @@ export async function securityContextMiddleware(
         }
       }
     }
+  } else if (!isWidgetClient && checkUnattestedScraperVelocity(ipHash, req)) {
+    // High-velocity unattested harvester spoofing a browser/iPhone UA -> trap in Ghost Mirage!
+    ctx.useMirage = true;
+    ctx.mirageReason = "unattested_velocity_scrape";
+    markHostileIp(ipHash, "unattested_velocity_scrape", 75, {
+      path: req.path,
+      method: req.method,
+      userAgent: ua,
+    });
   }
 
-  // CGNAT safety (Telstra/Optus/Vodafone shared carrier IPs):
-  // A cryptographically verified, clean, non-tampered hardware-attested iPhone proves it is a
-  // genuine parent device and is never penalized if an unrelated scraper shared the same mobile IP.
-  const verifiedCleanHardware =
-    ctx.isAttested && !ctx.isTamperedClient && !ctx.isReplayAttack && !ctx.isScraperUa;
+  // Strict CGNAT override: ONLY truly Apple-PKI-verified `app_attest` hardware keys may override
+  // an IP-level hostile ban — self-enrolled software/unattested keys CANNOT escape a hostile IP ban!
+  const verifiedAppleHardware =
+    ctx.isAppleHardwareVerified && !ctx.isTamperedClient && !ctx.isReplayAttack && !ctx.isScraperUa;
 
-  // Classify hostile IPs & scraper bots for Ghost Mirage + Progressive Tarpit
-  if (!ctx.useMirage && !verifiedCleanHardware && (ctx.isHostile || ctx.isScraperUa)) {
+  if (!ctx.useMirage && !verifiedAppleHardware && (ctx.isHostile || ctx.isScraperUa)) {
     ctx.useMirage = true;
     ctx.mirageReason = ctx.isHostile ? "hostile_fingerprint" : "automated_scraper_ua";
     if (ctx.isScraperUa && !ctx.isHostile) {
@@ -387,7 +596,7 @@ export async function securityContextMiddleware(
   next();
 }
 
-// ─── Zero-Trust Cryptographic StoreKit 2 ES256 JWS Verifier ─────────────────
+// ─── Zero-Trust Cryptographic StoreKit 2 ES256 JWS Verifier (Pinned Apple Root CA) ─
 
 export interface StoreKitVerificationResult {
   valid: boolean;
@@ -434,36 +643,37 @@ export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResul
       return { valid: false, reason: "expired_subscription" };
     }
 
-    // Parse & cryptographically verify the X.509 certificate chain inside x5c
+    // Parse & verify EVERY certificate's date window inside x5c
     const certs: crypto.X509Certificate[] = [];
+    const now = Date.now();
     for (const rawCert of header.x5c.slice(0, 4)) {
       if (typeof rawCert !== "string" || rawCert.length < 100) {
         return { valid: false, reason: "invalid_cert_entry" };
       }
-      certs.push(new crypto.X509Certificate(Buffer.from(rawCert, "base64")));
+      const cert = new crypto.X509Certificate(Buffer.from(rawCert, "base64"));
+      if (new Date(cert.validFrom).getTime() > now || new Date(cert.validTo).getTime() < now) {
+        return { valid: false, reason: "cert_not_valid_now" };
+      }
+      certs.push(cert);
     }
 
-    const now = Date.now();
-    const leaf = certs[0];
-    if (new Date(leaf.validFrom).getTime() > now || new Date(leaf.validTo).getTime() < now) {
-      return { valid: false, reason: "leaf_cert_not_valid_now" };
-    }
-
-    // Verify each link in the x5c chain cryptographically & confirm Apple issuer
-    let sawAppleChain = false;
+    // Verify EVERY cryptographic link in the x5c chain
     for (let i = 0; i < certs.length - 1; i++) {
       if (!certs[i].verify(certs[i + 1].publicKey)) {
         return { valid: false, reason: "x5c_chain_signature_invalid" };
       }
-      if (/Apple Inc\.|Apple Worldwide Developer Relations|Apple Root CA/i.test(certs[i + 1].subject)) {
-        sawAppleChain = true;
-      }
     }
-    if (!sawAppleChain) {
-      return { valid: false, reason: "non_apple_cert_chain" };
+
+    // CRITICAL: Pin the root certificate directly to official Apple Root CA - G3 / G2 SHA-256 fingerprints
+    // (Rejects any self-signed forged certificate even if CN="Apple Root CA"!)
+    const rootCert = certs[certs.length - 1];
+    const rootFp = rootCert.fingerprint256.toUpperCase();
+    if (!PINNED_APPLE_STOREKIT_ROOT_FINGERPRINTS.has(rootFp) || !rootCert.verify(rootCert.publicKey)) {
+      return { valid: false, reason: "untrusted_root_ca_fingerprint" };
     }
 
     // Cryptographically verify the JWS ES256 signature against leaf.publicKey
+    const leaf = certs[0];
     const signingInput = Buffer.from(`${parts[0]}.${parts[1]}`, "ascii");
     const sigBuf = Buffer.from(parts[2], "base64url");
     if (sigBuf.length !== 64) {
