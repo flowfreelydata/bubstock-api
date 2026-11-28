@@ -47,6 +47,7 @@ const MAX_CHALLENGES = 5_000;
 const CHALLENGE_TTL_MS = 120_000;
 const TIMESTAMP_DRIFT_MS = 120_000;
 const MAX_NONCE_CACHE = 25_000;
+const MAX_COUNTER_WINDOWS = 10_000;
 const REPLAY_WINDOW_SIZE = 64;
 const UNATTESTED_VELOCITY_WINDOW_MS = 60_000;
 const UNATTESTED_VELOCITY_LIMIT = 14;
@@ -180,7 +181,7 @@ function decodeCbor(buf: Buffer): unknown {
  * 4. Verifies Apple App Attest Nonce OID `1.2.840.113635.100.8.2` embeds `SHA256(authData || SHA256(challenge))`.
  * 5. When `APPLE_TEAM_ID` is configured, verifies `authData[0..32]` equals `SHA256("<TEAM_ID>.au.com.bubstock.app")`.
  */
-export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string): boolean {
+export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string, keyId: string): boolean {
   if (typeof cborB64 !== "string" || cborB64.length < 120 || cborB64.length > 16_000) return false;
   try {
     const raw = Buffer.from(cborB64, "base64");
@@ -200,6 +201,9 @@ export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string): b
       certs.push(new crypto.X509Certificate(item));
     }
 
+    // Leaf credential certificate must not be a CA
+    if (certs[0].ca) return false;
+
     const now = Date.now();
     for (const cert of certs) {
       if (new Date(cert.validFrom).getTime() > now || new Date(cert.validTo).getTime() < now) {
@@ -217,19 +221,19 @@ export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string): b
       top.verify(APPLE_APP_ATTEST_ROOT_CA.publicKey);
     if (!chainsToPinnedAppleRoot) return false;
 
-    // Verify Apple App Attest Nonce extension: SHA256(authData || SHA256(challenge))
-    const clientDataHash = crypto.createHash("sha256").update(challenge, "utf8").digest();
-    const expectedNonce = crypto
+    // Verify Apple App Attest Nonce extension cryptographically commits to BOTH the challenge AND enrolled keyId:
+    // SHA256(authData || SHA256(challenge + ":" + keyId)) — prevents splicing a valid App Attest CBOR onto a rogue software key.
+    const boundClientDataHash = crypto.createHash("sha256").update(`${challenge}:${keyId}`, "utf8").digest();
+    const expectedBoundNonce = crypto
       .createHash("sha256")
-      .update(Buffer.concat([decoded.authData, clientDataHash]))
+      .update(Buffer.concat([decoded.authData, boundClientDataHash]))
       .digest();
 
     const credRaw = certs[0].raw;
     const oidPos = credRaw.indexOf(APPLE_ATTEST_NONCE_OID_DER);
     if (oidPos === -1) return false;
-    // The 32-byte nonce octet string follows directly inside the extension envelope after the OID
     const extWindow = credRaw.subarray(oidPos, Math.min(credRaw.length, oidPos + 96));
-    if (extWindow.indexOf(expectedNonce) === -1) return false;
+    if (extWindow.indexOf(expectedBoundNonce) === -1) return false;
 
     // Optional strict App ID hash check once APPLE_TEAM_ID is configured in Railway
     const teamId = process.env.APPLE_TEAM_ID?.trim();
@@ -337,7 +341,7 @@ export async function enrollHardwareKey(params: {
     return { ok: false, status: 403, error: "Hardware challenge signature verification failed" };
   }
 
-  const hasValidAppleAttest = verifyAppleAppAttestCbor(params.appAttestObjectB64, challenge);
+  const hasValidAppleAttest = verifyAppleAppAttestCbor(params.appAttestObjectB64, challenge, keyId);
   const rawMode = typeof params.attestMode === "string" ? params.attestMode : "secure_enclave";
   const attestMode: AttestedKeyRecord["attestMode"] = hasValidAppleAttest
     ? "app_attest"
@@ -367,6 +371,10 @@ export async function enrollHardwareKey(params: {
     enrolledIpHash: params.ipHash,
   });
 
+  if (counterWindows.size >= MAX_COUNTER_WINDOWS && !counterWindows.has(keyId)) {
+    const oldest = counterWindows.keys().next().value;
+    if (oldest) counterWindows.delete(oldest);
+  }
   counterWindows.set(keyId, { highest: 0, seen: new Set<number>() });
   return { ok: true, status: 201, mode: attestMode };
 }
@@ -375,6 +383,10 @@ function checkSlidingReplayWindow(keyId: string, dbLastCounter: number, counter:
   if (!Number.isSafeInteger(counter) || counter <= 0) return false;
   let win = counterWindows.get(keyId);
   if (!win) {
+    if (counterWindows.size >= MAX_COUNTER_WINDOWS) {
+      const oldest = counterWindows.keys().next().value;
+      if (oldest) counterWindows.delete(oldest);
+    }
     win = { highest: dbLastCounter, seen: new Set<number>() };
     counterWindows.set(keyId, win);
   }
@@ -459,7 +471,10 @@ export async function securityContextMiddleware(
   const ipHash = hashIp(req.ip);
   const ua = String(req.headers["user-agent"] ?? "");
   const isScraperUa = SCRAPER_BOT_UA_RE.test(ua);
-  const isWidgetClient = String(req.headers["x-bubstock-client"] ?? "").toLowerCase() === "ios-widget";
+  const isWidgetClient =
+    String(req.headers["x-bubstock-client"] ?? "").toLowerCase() === "ios-widget" &&
+    (req.path === "/specials" || req.path === "/pulse") &&
+    req.query.product === undefined;
 
   const ctx: RequestSecurityContext = {
     ipHash,

@@ -314,7 +314,7 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   const origJson = res.json.bind(res);
   res.json = ((body: unknown) => {
     const raw = JSON.stringify(body);
-    if (raw.length < 1024) {
+    if (typeof raw !== "string" || raw.length < 1024) {
       return origJson(body);
     }
     const compressed = zlib.gzipSync(raw, { level: 6 });
@@ -396,7 +396,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "3.2.0",
+    version: "3.3.0",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
@@ -499,7 +499,7 @@ app.get("/admin/security/summary", async (req: Request, res: Response) => {
   res.setHeader("Cache-Control", "no-store, private");
   res.json({
     service: "bubstock-au-api",
-    version: "3.2.0",
+    version: "3.3.0",
     ...summary,
     generatedAt: new Date().toISOString(),
   });
@@ -787,6 +787,30 @@ app.get("/compare", antiLeechGuard, priceLimit, async (req: Request, res: Respon
   if (req.security?.useMirage) {
     await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
     res.setHeader("Cache-Control", "no-store, private");
+    const warm = priceCache.get(`${cleanProduct.toLowerCase()}|${ctx.state}`);
+    if (warm) {
+      const wowPoolW = warm.entries.filter((e) => e.retailer === "Woolworths");
+      const colesPoolW = warm.entries.filter((e) => e.retailer === "Coles");
+      const pairedW = pickBestComparablePair(cleanProduct, wowPoolW, colesPoolW);
+      if (pairedW.wow || pairedW.coles) {
+        const baseComp: HeadToHeadComparison = {
+          query: cleanProduct,
+          suburb: cleanSuburb,
+          state: ctx.state,
+          matchQuality: pairedW.wow && pairedW.coles ? "exact" : "single_retailer",
+          woolworths: pairedW.wow,
+          coles: pairedW.coles,
+          cheaperRetailer: null,
+          priceDifference: null,
+          percentDifference: null,
+          unitSummary: null,
+          retailerStatus: warm.retailerStatus,
+          fetchedAt: warm.fetchedAt,
+        };
+        res.json(transformToGhostComparison(baseComp, req.security.ipHash));
+        return;
+      }
+    }
     res.json(buildSyntheticMirageComparison(cleanProduct, cleanSuburb, ctx.state, req.security.ipHash));
     return;
   }
@@ -859,13 +883,6 @@ app.get("/compare", antiLeechGuard, priceLimit, async (req: Request, res: Respon
     retailerStatus: result.retailerStatus,
     fetchedAt: result.fetchedAt,
   };
-
-  if (req.security?.useMirage) {
-    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
-    res.setHeader("Cache-Control", "no-store, private");
-    res.json(transformToGhostComparison(comparison, req.security.ipHash));
-    return;
-  }
 
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=900");
   res.json(comparison);
@@ -953,8 +970,8 @@ app.post("/prices/ingest", ingestLimit, async (req: Request, res: Response) => {
 
     valid.push({
       retailer: raw.retailer,
-      storeName: typeof raw.storeName === "string" ? raw.storeName.slice(0, 100) : `${raw.retailer} Online (${cleanState})`,
-      suburb: String(suburb).slice(0, 60),
+      storeName: typeof raw.storeName === "string" ? sanitizeText(raw.storeName, 100) : `${raw.retailer} Online (${cleanState})`,
+      suburb: cleanSuburb,
       state: cleanState,
       matchedName: raw.matchedName.trim().slice(0, 200),
       brand: typeof raw.brand === "string" ? raw.brand.trim().slice(0, 80) : undefined,
@@ -1060,16 +1077,16 @@ app.post("/specials/ingest", ingestLimit, async (req: Request, res: Response) =>
 
 // ─── Real Price History (Postgres + Zero-Trust Deep Archive Gate) ────────────
 
-app.get("/prices/history", antiLeechGuard, async (req: Request, res: Response) => {
-  const { product, weeks = "12" } = req.query;
-  if (!product || typeof product !== "string" || product.trim().length < 2) {
+app.get("/prices/history", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
+  const cleanProduct = sanitizeText(req.query.product, 120);
+  if (cleanProduct.length < 2) {
     res.status(400).json({ error: "product query param required" });
     return;
   }
 
   const ctx = resolveCityAndState(req);
-  const cleanSuburb = String(req.query.suburb ?? ctx.defaultSuburb);
-  const requestedWeeks = Math.min(Math.max(Number(weeks) || 12, 1), 52);
+  const cleanSuburb = sanitizeText(req.query.suburb, 60) || ctx.defaultSuburb;
+  const requestedWeeks = Math.min(Math.max(Number(req.query.weeks ?? 12) || 12, 1), 52);
 
   // Zero-Trust Server-Side Entitlement Gate: deep 13–52 week historical dumps require
   // a cryptographically verified Apple StoreKit 2 ES256 JWS receipt header.
@@ -1077,17 +1094,17 @@ app.get("/prices/history", antiLeechGuard, async (req: Request, res: Response) =
     requestedWeeks <= 12 || verifyStoreKitJwsCrypto(req.headers["x-bubstock-receipt"]).valid;
   const effectiveWeeks = deepArchiveAllowed ? requestedWeeks : 12;
 
-  let rows = await getPriceHistory(product.trim(), cleanSuburb, ctx.state, effectiveWeeks);
+  let rows = await getPriceHistory(cleanProduct, cleanSuburb, ctx.state, effectiveWeeks);
   // Fall back to VIC chain history if newer state archive is still building up (same national chain pricing)
   if (rows.length === 0 && ctx.state !== "VIC") {
-    rows = await getPriceHistory(product.trim(), "Melbourne", "VIC", effectiveWeeks);
+    rows = await getPriceHistory(cleanProduct, "Melbourne", "VIC", effectiveWeeks);
   }
 
   if (req.security?.useMirage) {
     await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
     res.setHeader("Cache-Control", "no-store, private");
     res.json({
-      productName: product.trim(),
+      productName: cleanProduct,
       suburb: cleanSuburb,
       state: ctx.state,
       weeks: transformToGhostHistory(rows, req.security.ipHash),
@@ -1098,7 +1115,7 @@ app.get("/prices/history", antiLeechGuard, async (req: Request, res: Response) =
 
   res.setHeader("Cache-Control", "public, max-age=600, s-maxage=600");
   res.json({
-    productName: product.trim(),
+    productName: cleanProduct,
     suburb: cleanSuburb,
     state: ctx.state,
     weeks: rows,
@@ -1220,10 +1237,12 @@ async function loadCityStores(city: AuCity): Promise<MelbourneStore[]> {
 
 app.get("/stores", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   const ctx = resolveCityAndState(req);
-  const lat = req.query.lat !== undefined ? Number(req.query.lat) : ctx.defaultLat;
-  const lon = req.query.lon !== undefined ? Number(req.query.lon) : ctx.defaultLon;
-  const radius = Math.min(Number(req.query.radius ?? 25_000) || 25_000, 60_000);
-  const limit = Math.min(Number(req.query.limit ?? 60) || 60, 200);
+  const rawLat = req.query.lat !== undefined ? Number(req.query.lat) : NaN;
+  const rawLon = req.query.lon !== undefined ? Number(req.query.lon) : NaN;
+  const lat = Number.isFinite(rawLat) && rawLat >= -45 && rawLat <= -9 ? rawLat : ctx.defaultLat;
+  const lon = Number.isFinite(rawLon) && rawLon >= 110 && rawLon <= 156 ? rawLon : ctx.defaultLon;
+  const radius = Math.max(500, Math.min(Number(req.query.radius ?? 25_000) || 25_000, 60_000));
+  const limit = Math.max(1, Math.min(Math.floor(Number(req.query.limit ?? 60) || 60), 200));
 
   const stores = await loadCityStores(ctx.city);
   const nearby = stores
@@ -1352,7 +1371,7 @@ app.get("/sightings", async (req: Request, res: Response) => {
   });
 });
 
-app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
+app.post("/sightings", antiLeechGuard, sightingLimit, async (req: Request, res: Response) => {
   const { productId, productName, storeId, storeName, suburb, retailer, state, observedPrice, note, deviceId } =
     req.body ?? {};
 
@@ -1471,8 +1490,13 @@ app.post("/sightings", sightingLimit, async (req: Request, res: Response) => {
 const ALLOWED_SOCIAL_HOST_RE =
   /^(www\.|m\.|vm\.|vt\.|mobile\.)?(tiktok\.com|instagram\.com|facebook\.com|fb\.watch|fb\.com|youtube\.com|youtu\.be|threads\.net|x\.com|twitter\.com|reddit\.com)$/i;
 
-app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => {
+app.post("/promo/submit", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
   const { platform, postUrl, referralCode, city, deviceId } = req.body ?? {};
+  const cleanDeviceId = sanitizeText(deviceId, 80);
+  if (!VALID_DEVICE_ID_RE.test(cleanDeviceId)) {
+    res.status(400).json({ error: "Valid app deviceId required." });
+    return;
+  }
   if (typeof postUrl !== "string" || postUrl.trim().length < 16) {
     res.status(400).json({ error: "Please paste a valid public TikTok, Instagram, Facebook or YouTube post link." });
     return;
@@ -1589,7 +1613,7 @@ app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => 
     postUrl: cleanUrl,
     referralCode: typeof referralCode === "string" ? referralCode.trim().slice(0, 12) : undefined,
     city: typeof city === "string" ? city.trim().slice(0, 40) : undefined,
-    deviceId: sanitizeText(deviceId, 80) || req.ip,
+    deviceId: cleanDeviceId,
   });
 
   if (saved.alreadyClaimedByDevice) {
@@ -1901,8 +1925,8 @@ async function handlePulse(req: Request, res: Response) {
   res.json(pulse);
 }
 
-app.get("/pulse", handlePulse);
-app.get("/melbourne/pulse", handlePulse);
+app.get("/pulse", antiLeechGuard, handlePulse);
+app.get("/melbourne/pulse", antiLeechGuard, handlePulse);
 
 // ─── Zero-Knowledge E2EE Two-Parent Household Sync (Write-Proof Protected) ───
 
@@ -2025,7 +2049,7 @@ app.post("/groups/join", strictBotGuard, sightingLimit, async (req: Request, res
   res.json(result.status);
 });
 
-app.get("/groups/:code", async (req: Request, res: Response) => {
+app.get("/groups/:code", strictBotGuard, vaultReadLimit, async (req: Request, res: Response) => {
   const status = await getMothersGroup(String(req.params.code ?? ""));
   if (!status) {
     res.status(404).json({ error: "Group not found" });
@@ -2219,7 +2243,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "3.2.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "3.3.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

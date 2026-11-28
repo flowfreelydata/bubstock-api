@@ -33,7 +33,12 @@ function layout(opts: {
   <meta property="og:title" content="${escapeHtml(opts.title)}" />
   <meta property="og:description" content="${escapeHtml(opts.description)}" />
   <meta property="og:type" content="website" />
-  <script type="application/ld+json">${JSON.stringify(opts.jsonLd).replace(/</g, "\\u003c")}</script>
+  <script type="application/ld+json">${JSON.stringify(opts.jsonLd)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")}</script>
   <style>
     :root { --bg:#f5f8f7; --card:#fff; --ink:#142220; --muted:#566865; --teal:#0d7a6c; --good:#118357; --bad:#c63b2b; --line:#e3ecea; }
     * { box-sizing:border-box; }

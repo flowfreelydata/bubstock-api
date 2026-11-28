@@ -33,6 +33,10 @@ pool?.on("error", (err) => {
 const memorySightings: ShelfSighting[] = [];
 const memorySpecials = new Map<string, SpecialEntry>();
 
+function escapeLikePattern(raw: string): string {
+  return raw.replace(/[\\%_]/g, "\\$&");
+}
+
 export async function pingDB(): Promise<boolean> {
   if (!pool) return false;
   try {
@@ -340,8 +344,9 @@ export async function getFreshRetailerPrices(
   if (tokens.length === 0) return [];
 
   try {
-    const tokenClauses = tokens.map(
-      (_t, i) => `(lower(product_name) LIKE '%' || $${i + 3} || '%' OR lower(matched_name) LIKE '%' || $${i + 3} || '%')`
+    const escapedTokens = tokens.map(escapeLikePattern);
+    const tokenClauses = escapedTokens.map(
+      (_t, i) => `(lower(product_name) LIKE '%' || $${i + 3} || '%' ESCAPE '\\' OR lower(matched_name) LIKE '%' || $${i + 3} || '%' ESCAPE '\\')`
     );
     const result = await pool.query(
       `SELECT DISTINCT ON (COALESCE(stockcode, lower(matched_name)))
@@ -358,7 +363,7 @@ export async function getFreshRetailerPrices(
          )
        ORDER BY COALESCE(stockcode, lower(matched_name)), fetched_at DESC
        LIMIT 16`,
-      [retailer, maxAgeHours, ...tokens]
+      [retailer, maxAgeHours, ...escapedTokens]
     );
 
     return result.rows.map((r) => {
@@ -510,6 +515,7 @@ export async function getPriceHistory(
 > {
   if (!pool) return [];
   try {
+    const escapedLike = escapeLikePattern(productName.trim().toLowerCase());
     const result = await pool.query(
       `SELECT
          TO_CHAR(DATE_TRUNC('week', fetched_at), 'YYYY-MM-DD') AS week,
@@ -518,12 +524,12 @@ export async function getPriceHistory(
          ROUND(MIN(price)::NUMERIC, 2)::FLOAT8 AS min_price,
          ROUND(MAX(price)::NUMERIC, 2)::FLOAT8 AS max_price
        FROM price_entries
-       WHERE (lower(product_name) = lower($1) OR lower(matched_name) LIKE '%' || lower($1) || '%')
+       WHERE (lower(product_name) = lower($1) OR lower(matched_name) LIKE '%' || $4 || '%' ESCAPE '\\')
          AND state = upper($2)
          AND fetched_at >= NOW() - ($3 || ' weeks')::INTERVAL
        GROUP BY DATE_TRUNC('week', fetched_at), retailer
        ORDER BY week ASC, retailer ASC`,
-      [productName, state || "VIC", weeks]
+      [productName.trim(), state || "VIC", weeks, escapedLike]
     );
     return result.rows;
   } catch (err) {
@@ -710,8 +716,9 @@ export async function getMedianProductPrice(
   if (tokens.length === 0) return null;
 
   try {
-    const tokenClauses = tokens.map(
-      (_t, i) => `(lower(product_name) LIKE '%' || $${i + 2} || '%' OR lower(matched_name) LIKE '%' || $${i + 2} || '%')`
+    const escapedTokens = tokens.map(escapeLikePattern);
+    const tokenClauses = escapedTokens.map(
+      (_t, i) => `(lower(product_name) LIKE '%' || $${i + 2} || '%' ESCAPE '\\' OR lower(matched_name) LIKE '%' || $${i + 2} || '%' ESCAPE '\\')`
     );
     const res = await pool.query(
       `SELECT
@@ -724,7 +731,7 @@ export async function getMedianProductPrice(
            lower(product_name) = lower($1)
            OR (${tokenClauses.join(" AND ")})
          )`,
-      [clean, ...tokens]
+      [clean, ...escapedTokens]
     );
     const row = res.rows[0];
     if (row && Number.isFinite(row.median) && row.median > 0 && row.cnt >= 1) {
@@ -732,14 +739,14 @@ export async function getMedianProductPrice(
     }
 
     // Fallback to live special_entries if product hasn't been searched individually yet
-    const spClauses = tokens.map((_t, i) => `lower(name) LIKE '%' || $${i + 1} || '%'`);
+    const spClauses = escapedTokens.map((_t, i) => `lower(name) LIKE '%' || $${i + 1} || '%' ESCAPE '\\'`);
     const spRes = await pool.query(
       `SELECT
          PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY was_price)::FLOAT8 AS median,
          COUNT(*)::INT AS cnt
        FROM special_entries
        WHERE ${spClauses.join(" AND ")}`,
-      tokens
+      escapedTokens
     );
     const spRow = spRes.rows[0];
     if (spRow && Number.isFinite(spRow.median) && spRow.median > 0 && spRow.cnt >= 1) {
@@ -1024,10 +1031,15 @@ export async function saveSocialPromo(input: {
   const record: SocialPromoRecord = { id, platform: input.platform, postUrl: input.postUrl, referralCode: input.referralCode, city: input.city, submittedAt };
 
   if (!pool) {
+    if (devHash && memoryDeviceClaims.has(devHash)) {
+      return { duplicate: true, alreadyClaimedByDevice: true };
+    }
     if (memoryPromos.some((p) => p.postUrl.toLowerCase() === input.postUrl.toLowerCase())) {
       return { duplicate: true };
     }
     memoryPromos.unshift(record);
+    if (memoryPromos.length > 500) memoryPromos.pop();
+    if (devHash) memoryDeviceClaims.add(devHash);
     return { duplicate: false, record };
   }
 
@@ -1118,7 +1130,8 @@ export async function upsertPushSubscription(
 
   if (!pool) {
     const existing = memoryPushSubs.get(sub.deviceId);
-    if (existing?.ownerKeyId && sub.ownerKeyId && existing.ownerKeyId !== sub.ownerKeyId) {
+    // Strict IDOR protection: once bound to a hardware key, unattested OR mismatched callers are rejected
+    if (existing?.ownerKeyId && existing.ownerKeyId !== sub.ownerKeyId) {
       return { ok: false, forbidden: true };
     }
     const full: PushSubscriptionRecord = {
@@ -1135,7 +1148,7 @@ export async function upsertPushSubscription(
     [sub.deviceId]
   );
   const storedOwner = existing.rows[0]?.owner_key_id ? String(existing.rows[0].owner_key_id) : undefined;
-  if (storedOwner && sub.ownerKeyId && storedOwner !== sub.ownerKeyId) {
+  if (storedOwner && storedOwner !== sub.ownerKeyId) {
     return { ok: false, forbidden: true };
   }
 
@@ -1224,6 +1237,10 @@ export async function markPushAlertSentIfNew(deviceId: string, alertKey: string)
   if (!pool) {
     const k = `${deviceId}|${alertKey}`;
     if (memorySentKeys.has(k)) return false;
+    if (memorySentKeys.size >= 10_000) {
+      const oldest = memorySentKeys.keys().next().value;
+      if (oldest) memorySentKeys.delete(oldest);
+    }
     memorySentKeys.add(k);
     return true;
   }
@@ -1445,12 +1462,23 @@ export async function getReferralCodeOwnerStatus(
 export async function hasDeviceVerifiedPromoOrReferral(deviceId: string): Promise<boolean> {
   const devHash = hashDeviceId(deviceId);
   if (!devHash) return false;
-  if (!pool) return memoryDeviceClaims.has(devHash);
+  if (!pool) {
+    if (memoryDeviceClaims.has(devHash)) return true;
+    for (const ref of memoryReferrals.values()) {
+      if (ref.ownerHash === devHash && ref.redeemers.size > 0) return true;
+    }
+    return false;
+  }
   try {
     const r = await pool.query(
       `SELECT 1 FROM device_promo_claims
        WHERE device_hash = $1
          AND claimed_at >= NOW() - INTERVAL '370 days'
+       UNION ALL
+       SELECT 1 FROM referral_codes
+       WHERE owner_device_hash = $1
+         AND COALESCE(array_length(redeemer_hashes, 1), 0) > 0
+         AND created_at >= NOW() - INTERVAL '370 days'
        LIMIT 1`,
       [devHash]
     );
@@ -1496,20 +1524,42 @@ export async function createMothersGroup(
 ): Promise<MothersGroupStatus> {
   const hash = hashDeviceId(deviceId) ?? crypto.randomUUID().slice(0, 16);
   const ipHash = hashIp(clientIp);
-  const code = generateGroupCode();
   const createdAt = new Date().toISOString();
 
   if (!pool) {
+    let code = generateGroupCode();
+    for (let attempt = 0; attempt < 5 && memoryGroups.has(code); attempt++) {
+      code = generateGroupCode();
+    }
+    if (memoryGroups.size >= 5_000) {
+      const oldest = memoryGroups.keys().next().value;
+      if (oldest) memoryGroups.delete(oldest);
+    }
     memoryGroups.set(code, { suburb, city, members: new Set([hash]), ips: [ipHash], createdAt });
     return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
   }
 
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = generateGroupCode();
+    const res = await pool.query(
+      `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes, member_ip_hashes)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (group_code) DO NOTHING
+       RETURNING group_code`,
+      [code, suburb, city, [hash], [ipHash]]
+    );
+    if ((res.rowCount ?? 0) > 0) {
+      return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
+    }
+  }
+  const fallbackCode = `MG${crypto.randomBytes(4).toString("hex").toUpperCase().slice(0, 6)}`;
   await pool.query(
     `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes, member_ip_hashes)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [code, suburb, city, [hash], [ipHash]]
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (group_code) DO NOTHING`,
+    [fallbackCode, suburb, city, [hash], [ipHash]]
   );
-  return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
+  return { groupCode: fallbackCode, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
 }
 
 export async function joinMothersGroup(
@@ -1531,6 +1581,9 @@ export async function joinMothersGroup(
       g.ips.push(ipHash);
     }
     const count = g.members.size;
+    if (count >= 3) {
+      for (const m of g.members) memoryDeviceClaims.add(m);
+    }
     return {
       status: {
         groupCode: cleanCode,
@@ -1569,11 +1622,15 @@ export async function joinMothersGroup(
       [cleanCode, hash, ipHash]
     );
     const updated = res.rows[0];
-    const count = Array.isArray(updated.member_hashes) ? updated.member_hashes.length : 1;
+    const allMembers: string[] = Array.isArray(updated.member_hashes) ? updated.member_hashes : [hash];
+    const count = allMembers.length;
     if (count >= 3) {
+      // Grant server-verified syndicate preview credit to ALL members in the group (mums 1, 2 & 3!)
       await pool.query(
-        `INSERT INTO device_promo_claims (device_hash, kind) VALUES ($1, 'syndicate') ON CONFLICT (device_hash) DO NOTHING`,
-        [hash]
+        `INSERT INTO device_promo_claims (device_hash, kind)
+         SELECT DISTINCT unnest($1::text[]), 'syndicate'
+         ON CONFLICT (device_hash) DO NOTHING`,
+        [allMembers]
       ).catch(() => {});
     }
     return {
@@ -1732,8 +1789,8 @@ export async function detectShrinkflation(productFilter?: string): Promise<Shrin
     const params: string[] = [];
     let filterSql = "";
     if (productFilter && productFilter.trim().length >= 3) {
-      params.push(productFilter.trim().toLowerCase());
-      filterSql = `AND (lower(product_name) LIKE '%' || $1 || '%' OR lower(matched_name) LIKE '%' || $1 || '%')`;
+      params.push(escapeLikePattern(productFilter.trim().toLowerCase()));
+      filterSql = `AND (lower(product_name) LIKE '%' || $1 || '%' ESCAPE '\\' OR lower(matched_name) LIKE '%' || $1 || '%' ESCAPE '\\')`;
     }
 
     const res = await pool.query(
