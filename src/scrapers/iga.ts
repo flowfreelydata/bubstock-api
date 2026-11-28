@@ -1,3 +1,4 @@
+import { singleflight } from "../cache.js";
 import type {
   AuCity,
   AuStateLower,
@@ -26,6 +27,7 @@ const CITY_BOUNDS: Record<
   AuCity,
   {
     stateUpper: AuStateUpper;
+    acceptedStates: string[];
     stateLower: AuStateLower;
     defaultSuburb: string;
     latMin: number;
@@ -34,12 +36,12 @@ const CITY_BOUNDS: Record<
     lonMax: number;
   }
 > = {
-  melbourne: { stateUpper: "VIC", stateLower: "vic", defaultSuburb: "Melbourne", latMin: -38.30, latMax: -37.50, lonMin: 144.45, lonMax: 145.55 },
-  sydney:    { stateUpper: "NSW", stateLower: "nsw", defaultSuburb: "Sydney",    latMin: -34.18, latMax: -33.55, lonMin: 150.60, lonMax: 151.35 },
-  brisbane:  { stateUpper: "QLD", stateLower: "qld", defaultSuburb: "Brisbane",  latMin: -28.05, latMax: -27.05, lonMin: 152.65, lonMax: 153.55 },
-  perth:     { stateUpper: "WA",  stateLower: "wa",  defaultSuburb: "Perth",     latMin: -32.60, latMax: -31.45, lonMin: 115.60, lonMax: 116.25 },
-  adelaide:  { stateUpper: "SA",  stateLower: "sa",  defaultSuburb: "Adelaide",  latMin: -35.30, latMax: -34.55, lonMin: 138.45, lonMax: 138.85 },
-  tasmania:  { stateUpper: "TAS", stateLower: "tas", defaultSuburb: "Hobart",    latMin: -43.65, latMax: -40.65, lonMin: 144.50, lonMax: 148.50 },
+  melbourne: { stateUpper: "VIC", acceptedStates: ["VIC"],        stateLower: "vic", defaultSuburb: "Melbourne", latMin: -39.25, latMax: -33.95, lonMin: 140.95, lonMax: 150.05 },
+  sydney:    { stateUpper: "NSW", acceptedStates: ["NSW", "ACT"], stateLower: "nsw", defaultSuburb: "Sydney",    latMin: -37.55, latMax: -28.15, lonMin: 140.95, lonMax: 153.68 },
+  brisbane:  { stateUpper: "QLD", acceptedStates: ["QLD"],        stateLower: "qld", defaultSuburb: "Brisbane",  latMin: -29.20, latMax: -10.50, lonMin: 137.95, lonMax: 153.60 },
+  perth:     { stateUpper: "WA",  acceptedStates: ["WA"],         stateLower: "wa",  defaultSuburb: "Perth",     latMin: -35.20, latMax: -13.60, lonMin: 112.90, lonMax: 129.05 },
+  adelaide:  { stateUpper: "SA",  acceptedStates: ["SA", "NT"],   stateLower: "sa",  defaultSuburb: "Adelaide",  latMin: -38.10, latMax: -10.90, lonMin: 128.95, lonMax: 141.05 },
+  tasmania:  { stateUpper: "TAS", acceptedStates: ["TAS"],        stateLower: "tas", defaultSuburb: "Hobart",    latMin: -43.75, latMax: -39.50, lonMin: 143.80, lonMax: 148.55 },
 };
 
 interface IgaProduct {
@@ -198,20 +200,23 @@ let allIgaStoresExpiry = 0;
 
 async function fetchAllIgaRaw(): Promise<IgaRawStore[]> {
   if (allIgaStoresCache && Date.now() < allIgaStoresExpiry) return allIgaStoresCache;
-  try {
-    const r = await fetch(`${API_BASE}/stores`, {
-      headers: { "User-Agent": UA, Accept: "application/json", Referer: `${WEB_BASE}/` },
-      signal: AbortSignal.timeout(12_000),
-    });
-    if (!r.ok) return [];
-    const data = (await r.json()) as { items?: IgaRawStore[] };
-    allIgaStoresCache = data.items ?? [];
-    allIgaStoresExpiry = Date.now() + 12 * 60 * 60 * 1000;
-    return allIgaStoresCache;
-  } catch (err) {
-    console.warn("[iga] stores fetch failed:", (err as Error).message);
-    return [];
-  }
+  return singleflight("iga:stores:all", async () => {
+    if (allIgaStoresCache && Date.now() < allIgaStoresExpiry) return allIgaStoresCache;
+    try {
+      const r = await fetch(`${API_BASE}/stores`, {
+        headers: { "User-Agent": UA, Accept: "application/json", Referer: `${WEB_BASE}/` },
+        signal: AbortSignal.timeout(12_000),
+      });
+      if (!r.ok) return allIgaStoresCache ?? [];
+      const data = (await r.json()) as { items?: IgaRawStore[] };
+      allIgaStoresCache = data.items ?? [];
+      allIgaStoresExpiry = Date.now() + 12 * 60 * 60 * 1000;
+      return allIgaStoresCache;
+    } catch (err) {
+      console.warn("[iga] stores fetch failed:", (err as Error).message);
+      return allIgaStoresCache ?? [];
+    }
+  });
 }
 
 export async function fetchIgaCityStores(
@@ -221,9 +226,11 @@ export async function fetchIgaCityStores(
   const raw = await fetchAllIgaRaw();
   const byId = new Map<string, MelbourneStore>();
 
+  const accepted = new Set(b.acceptedStates);
   for (const s of raw) {
     if ((s.status ?? "").toLowerCase() !== "active") continue;
-    if ((s.countyProvinceState ?? "").toUpperCase() !== b.stateUpper) continue;
+    const rawState = (s.countyProvinceState ?? "").toUpperCase();
+    if (!accepted.has(rawState)) continue;
     const lat = Number(s.location?.latitude);
     const lon = Number(s.location?.longitude);
     if (
@@ -252,7 +259,7 @@ export async function fetchIgaCityStores(
       name: (s.name ?? s.city ?? "IGA").trim(),
       streetAddress,
       suburb: (s.city ?? b.defaultSuburb).trim(),
-      state: b.stateLower,
+      state: rawState === "ACT" ? "act" : b.stateLower,
       postcode: (s.postCode ?? "").trim(),
       latitude: Number(lat.toFixed(6)),
       longitude: Number(lon.toFixed(6)),

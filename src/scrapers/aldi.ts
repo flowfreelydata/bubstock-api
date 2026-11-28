@@ -1,3 +1,4 @@
+import { singleflight } from "../cache.js";
 import type {
   AldiEquivalent,
   AuCity,
@@ -178,36 +179,41 @@ async function loadAldiMamiaCatalogue(): Promise<AldiProduct[]> {
   if (mamiaCache.length > 0 && Date.now() < mamiaCacheExpiry) {
     return mamiaCache;
   }
-  try {
-    const qs = new URLSearchParams({
-      currency: "AUD",
-      serviceType: "walk-in",
-      q: "mamia",
-      limit: "60",
-      offset: "0",
-      sort: "relevance",
-      servicePoint: DEFAULT_SERVICE_POINT,
-    });
-    const r = await fetch(`${API_BASE}/v3/product-search?${qs.toString()}`, {
-      headers: {
-        "User-Agent": UA,
-        Accept: "application/json",
-        Origin: WEB_BASE,
-        Referer: `${WEB_BASE}/`,
-      },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (!r.ok) return mamiaCache;
-    const data = (await r.json()) as AldiSearchResponse;
-    const items = (data?.data ?? []).filter((p) => (p.brandName ?? "").toUpperCase() === "MAMIA");
-    if (items.length > 0) {
-      mamiaCache = items;
-      mamiaCacheExpiry = Date.now() + 2 * 60 * 60 * 1000; // 2h cache: 1 upstream call serves all AU!
+  return singleflight("aldi:mamia", async () => {
+    if (mamiaCache.length > 0 && Date.now() < mamiaCacheExpiry) {
+      return mamiaCache;
     }
-    return mamiaCache;
-  } catch {
-    return mamiaCache;
-  }
+    try {
+      const qs = new URLSearchParams({
+        currency: "AUD",
+        serviceType: "walk-in",
+        q: "mamia",
+        limit: "60",
+        offset: "0",
+        sort: "relevance",
+        servicePoint: DEFAULT_SERVICE_POINT,
+      });
+      const r = await fetch(`${API_BASE}/v3/product-search?${qs.toString()}`, {
+        headers: {
+          "User-Agent": UA,
+          Accept: "application/json",
+          Origin: WEB_BASE,
+          Referer: `${WEB_BASE}/`,
+        },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!r.ok) return mamiaCache;
+      const data = (await r.json()) as AldiSearchResponse;
+      const items = (data?.data ?? []).filter((p) => (p.brandName ?? "").toUpperCase() === "MAMIA");
+      if (items.length > 0) {
+        mamiaCache = items;
+        mamiaCacheExpiry = Date.now() + 2 * 60 * 60 * 1000; // 2h cache: 1 upstream call serves all AU!
+      }
+      return mamiaCache;
+    } catch {
+      return mamiaCache;
+    }
+  });
 }
 
 /**
@@ -395,21 +401,12 @@ interface AldiRawServicePoint {
   };
 }
 
-const STANDARD_ALDI_HOURS = [
-  { weekday: 1, openMinute: 9 * 60, closeMinute: 20 * 60 },
-  { weekday: 2, openMinute: 8 * 60 + 30, closeMinute: 20 * 60 },
-  { weekday: 3, openMinute: 8 * 60 + 30, closeMinute: 20 * 60 },
-  { weekday: 4, openMinute: 8 * 60 + 30, closeMinute: 20 * 60 },
-  { weekday: 5, openMinute: 8 * 60 + 30, closeMinute: 20 * 60 },
-  { weekday: 6, openMinute: 8 * 60 + 30, closeMinute: 20 * 60 },
-  { weekday: 7, openMinute: 8 * 60 + 30, closeMinute: 20 * 60 },
-];
-
 const ALDI_CITY_CONFIG: Partial<
   Record<
     AuCity,
     {
       stateUpper: AuStateUpper;
+      acceptedStates: string[];
       stateLower: AuStateLower;
       defaultSuburb: string;
       defaultPostcode: string;
@@ -420,70 +417,101 @@ const ALDI_CITY_CONFIG: Partial<
 > = {
   melbourne: {
     stateUpper: "VIC",
+    acceptedStates: ["VIC"],
     stateLower: "vic",
     defaultSuburb: "Melbourne",
     defaultPostcode: "3000",
-    bounds: { latMin: -38.30, latMax: -37.50, lonMin: 144.45, lonMax: 145.55 },
+    bounds: { latMin: -39.25, latMax: -33.95, lonMin: 140.95, lonMax: 150.05 },
     points: [
-      [-37.8136, 144.9631],
-      [-37.7100, 144.9800],
-      [-37.8200, 145.1800],
-      [-37.9400, 145.1200],
-      [-38.1200, 145.1400],
-      [-37.8400, 144.7500],
+      [-37.8136, 144.9631], // CBD / North Melbourne
+      [-37.7800, 144.8200], // Sunshine / Footscray / Caroline Springs
+      [-37.8800, 144.7200], // Point Cook / Tarneit / Werribee
+      [-37.6800, 144.9500], // Craigieburn / Epping / North
+      [-37.8200, 145.1800], // East / Ringwood / Box Hill
+      [-38.0800, 145.1600], // South-East / Frankston / Cranbourne
+      [-38.1499, 144.3617], // Geelong
+      [-37.5622, 143.8503], // Ballarat
+      [-36.7570, 144.2794], // Bendigo
+      [-36.3833, 145.4000], // Shepparton
+      [-38.3830, 142.4880], // Warrnambool
+      [-38.1950, 146.5400], // Traralgon / Gippsland
+      [-36.1214, 146.8881], // Wodonga
+      [-34.1855, 142.1625], // Mildura
     ],
   },
   sydney: {
     stateUpper: "NSW",
+    acceptedStates: ["NSW", "ACT"],
     stateLower: "nsw",
     defaultSuburb: "Sydney",
     defaultPostcode: "2000",
-    bounds: { latMin: -34.18, latMax: -33.55, lonMin: 150.60, lonMax: 151.35 },
+    bounds: { latMin: -37.55, latMax: -28.15, lonMin: 140.95, lonMax: 153.68 },
     points: [
       [-33.8688, 151.2093],
       [-33.7970, 151.1800],
       [-33.8150, 151.0000],
-      [-33.7700, 150.8500],
-      [-33.9200, 150.9200],
-      [-34.0310, 151.0580],
+      [-33.7700, 150.8200],
+      [-33.9500, 150.9200],
+      [-34.4278, 150.8931], // Wollongong
+      [-33.4269, 151.3417], // Central Coast
+      [-32.9283, 151.7817], // Newcastle
+      [-35.2809, 149.1300], // Canberra / ACT
+      [-35.1082, 147.3598], // Wagga Wagga
+      [-30.2963, 153.1135], // Coffs Harbour
+      [-28.2000, 153.5400], // Tweed / Byron
+      [-31.0927, 150.9320], // Tamworth
     ],
   },
   brisbane: {
     stateUpper: "QLD",
+    acceptedStates: ["QLD"],
     stateLower: "qld",
     defaultSuburb: "Brisbane",
     defaultPostcode: "4000",
-    bounds: { latMin: -28.05, latMax: -27.05, lonMin: 152.65, lonMax: 153.55 },
+    bounds: { latMin: -29.20, latMax: -10.50, lonMin: 137.95, lonMax: 153.60 },
     points: [
       [-27.4698, 153.0251],
       [-27.3200, 153.0200],
-      [-27.5800, 153.0800],
+      [-27.6000, 153.0800],
       [-27.6200, 152.7600],
+      [-28.0167, 153.4000], // Gold Coast
+      [-26.6500, 153.0667], // Sunshine Coast
+      [-27.5598, 151.9507], // Toowoomba
+      [-25.2882, 152.8535], // Hervey Bay / Bundaberg
+      [-23.3791, 150.5100], // Rockhampton
     ],
   },
   perth: {
     stateUpper: "WA",
+    acceptedStates: ["WA"],
     stateLower: "wa",
     defaultSuburb: "Perth",
     defaultPostcode: "6000",
-    bounds: { latMin: -32.60, latMax: -31.45, lonMin: 115.60, lonMax: 116.25 },
+    bounds: { latMin: -35.20, latMax: -13.60, lonMin: 112.90, lonMax: 129.05 },
     points: [
       [-31.9505, 115.8605],
       [-31.7450, 115.7700],
       [-32.0569, 115.7439],
       [-32.3500, 115.7500],
+      [-33.3271, 115.6414], // Bunbury / Busselton
+      [-35.0269, 117.8837], // Albany
+      [-28.7774, 114.6150], // Geraldton
     ],
   },
   adelaide: {
     stateUpper: "SA",
+    acceptedStates: ["SA"],
     stateLower: "sa",
     defaultSuburb: "Adelaide",
     defaultPostcode: "5000",
-    bounds: { latMin: -35.30, latMax: -34.55, lonMin: 138.45, lonMax: 138.85 },
+    bounds: { latMin: -38.10, latMax: -25.95, lonMin: 128.95, lonMax: 141.05 },
     points: [
       [-34.9285, 138.6007],
       [-34.7600, 138.6400],
-      [-35.0200, 138.5500],
+      [-35.0500, 138.5500],
+      [-35.5525, 138.6216], // Victor Harbor
+      [-37.8284, 140.7804], // Mount Gambier
+      [-33.0333, 137.5667], // Whyalla / Port Pirie
     ],
   },
 };
@@ -493,67 +521,75 @@ export async function fetchAldiCityStores(city: AuCity): Promise<MelbourneStore[
   if (!cfg) return [];
 
   const byId = new Map<string, MelbourneStore>();
+  const accepted = new Set(cfg.acceptedStates);
 
-  for (const [lat, lon] of cfg.points) {
-    try {
-      const qs = new URLSearchParams({
-        addressLatitude: String(lat),
-        addressLongitude: String(lon),
-        radius: "35000",
-        "page[limit]": "50",
-      });
-      const r = await fetch(`${API_BASE}/v2/service-points?${qs.toString()}`, {
-        headers: {
-          "User-Agent": UA,
-          Accept: "application/json",
-          Origin: WEB_BASE,
-        },
-        signal: AbortSignal.timeout(10_000),
-      });
-      if (!r.ok) continue;
-      const data = (await r.json()) as { data?: AldiRawServicePoint[] };
+  const BATCH = 4;
+  for (let i = 0; i < cfg.points.length; i += BATCH) {
+    const slice = cfg.points.slice(i, i + BATCH);
+    await Promise.all(
+      slice.map(async ([lat, lon]) => {
+        try {
+          const qs = new URLSearchParams({
+            addressLatitude: String(lat),
+            addressLongitude: String(lon),
+            radius: "60000",
+            "page[limit]": "50",
+          });
+          const r = await fetch(`${API_BASE}/v2/service-points?${qs.toString()}`, {
+            headers: {
+              "User-Agent": UA,
+              Accept: "application/json",
+              Origin: WEB_BASE,
+            },
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (!r.ok) return;
+          const data = (await r.json()) as { data?: AldiRawServicePoint[] };
 
-      for (const s of data?.data ?? []) {
-        if (!s.id || s.id === "000-000") continue;
-        const addr = s.address;
-        if (!addr || (addr.regionIsoCode ?? "").toUpperCase() !== cfg.stateUpper) continue;
-        const slat = Number(addr.latitude);
-        const slon = Number(addr.longitude);
-        const b = cfg.bounds;
-        if (
-          !Number.isFinite(slat) ||
-          !Number.isFinite(slon) ||
-          slat < b.latMin ||
-          slat > b.latMax ||
-          slon < b.lonMin ||
-          slon > b.lonMax
-        ) {
-          continue;
+          for (const s of data?.data ?? []) {
+            if (!s.id || s.id === "000-000") continue;
+            const addr = s.address;
+            const rawState = (addr?.regionIsoCode ?? "").toUpperCase();
+            if (!addr || !accepted.has(rawState)) continue;
+            const slat = Number(addr.latitude);
+            const slon = Number(addr.longitude);
+            const b = cfg.bounds;
+            if (
+              !Number.isFinite(slat) ||
+              !Number.isFinite(slon) ||
+              slat < b.latMin ||
+              slat > b.latMax ||
+              slon < b.lonMin ||
+              slon > b.lonMax
+            ) {
+              continue;
+            }
+            const id = `aldi-${s.id}`;
+            if (byId.has(id)) continue;
+
+            const suburb = (addr.city ?? cfg.defaultSuburb).trim();
+            byId.set(id, {
+              id,
+              retailer: "aldi",
+              storeNo: s.id,
+              name: suburb,
+              streetAddress: (addr.address1 ?? s.name ?? "").trim(),
+              suburb,
+              state: rawState === "ACT" ? "act" : cfg.stateLower,
+              postcode: (addr.zipCode ?? cfg.defaultPostcode).trim(),
+              latitude: slat,
+              longitude: slon,
+              phone: s.publicPhoneNumber?.trim() || undefined,
+              hours: [],
+              hasDedicatedBabyAisle: false,
+              source: "aldi_api",
+            });
+          }
+        } catch (err) {
+          console.warn(`[aldi] ${city} store lookup (${lat},${lon}) failed:`, (err as Error).message);
         }
-        const id = `aldi-${s.id}`;
-        if (byId.has(id)) continue;
-
-        const suburb = (addr.city ?? cfg.defaultSuburb).trim();
-        byId.set(id, {
-          id,
-          retailer: "aldi",
-          storeNo: s.id,
-          name: suburb,
-          streetAddress: (addr.address1 ?? s.name ?? "").trim(),
-          suburb,
-          state: cfg.stateLower,
-          postcode: (addr.zipCode ?? cfg.defaultPostcode).trim(),
-          latitude: slat,
-          longitude: slon,
-          phone: s.publicPhoneNumber?.trim() || undefined,
-          hours: STANDARD_ALDI_HOURS,
-          hasDedicatedBabyAisle: false,
-          source: "aldi_api",
-        });
-      }
-    } catch (err) {
-      console.warn(`[aldi] ${city} store lookup (${lat},${lon}) failed:`, (err as Error).message);
-    }
+      })
+    );
   }
 
   return [...byId.values()].sort((a, b) => a.suburb.localeCompare(b.suburb));

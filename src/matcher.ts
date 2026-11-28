@@ -50,29 +50,35 @@ const KNOWN_BRANDS: Array<{ canonical: string; pattern: RegExp }> = [
 ];
 
 // Distinct product sub-lines that MUST NOT be cross-matched against each other
-const KNOWN_VARIANTS: Array<{ canonical: string; pattern: RegExp }> = [
-  { canonical: "supremepro", pattern: /\bsupreme\s*pro\b/ },
-  { canonical: "comfort", pattern: /\bcomfort\b/ },
+const KNOWN_VARIANTS: Array<{ canonical: string; pattern: RegExp; specialty?: boolean }> = [
+  { canonical: "supremepro", pattern: /\bsupreme\s*pro\b/, specialty: true },
+  { canonical: "comfort", pattern: /\bcomfort\b/, specialty: true },
   { canonical: "optipro", pattern: /\bopti\s*pro\b/ },
-  { canonical: "profutura", pattern: /\bprofutura\b/ },
-  { canonical: "allerpro", pattern: /\ballerpro\b/ },
-  { canonical: "colic", pattern: /\bcolic\b/ },
-  { canonical: "essensis", pattern: /\bessensis\b/ },
-  { canonical: "gentle gold", pattern: /\bgentle\s+gold\b/ },
-  { canonical: "nappy pants", pattern: /\bnappy\s+pants?\b/ },
-  { canonical: "swim nappies", pattern: /\b(swim\s+napp|little\s+swimmers)\b/ },
-  { canonical: "drynites", pattern: /\bdrynites\b/ },
+  { canonical: "profutura", pattern: /\bprofutura\b/, specialty: true },
+  { canonical: "allerpro", pattern: /\ballerpro\b/, specialty: true },
+  { canonical: "lactose intolerance", pattern: /\b(lactose\s+intoleran\w*|lactose\s+free|delact)\b/, specialty: true },
+  { canonical: "sensitive", pattern: /\b(sensitive|gentle\s+care|ar\s+formula|reflux|pepti|hypoallergenic|\bha\b)\b/, specialty: true },
+  { canonical: "colic", pattern: /\bcolic\b/, specialty: true },
+  { canonical: "essensis", pattern: /\bessensis\b/, specialty: true },
+  { canonical: "gentle gold", pattern: /\bgentle\s+gold\b/, specialty: true },
+  { canonical: "nappy pants", pattern: /\bnappy\s+pants?\b/, specialty: true },
+  { canonical: "swim nappies", pattern: /\b(swim\s+napp|little\s+swimmers)\b/, specialty: true },
+  { canonical: "drynites", pattern: /\bdrynites\b/, specialty: true },
   { canonical: "cosifit", pattern: /\bcosifit\b/ },
   { canonical: "ultra dry", pattern: /\bultra\s+dry\b/ },
   { canonical: "skin protect", pattern: /\bskin\s+protect\b/ },
   { canonical: "ultimate", pattern: /\bultimate\b/ },
-  { canonical: "pure sensitive", pattern: /\bpure\s*&?\s*sensitive\b/ },
+  { canonical: "pure sensitive", pattern: /\bpure\s*&?\s*sensitive\b/, specialty: true },
   { canonical: "yoghurt melts", pattern: /\byogh?urt\s+melts?\b/ },
   { canonical: "pickup sticks", pattern: /\b(pickup|pick-up)\s+sticks?\b/ },
   { canonical: "round-a-bouts", pattern: /\bround[- ]?a[- ]?bouts?\b/ },
   { canonical: "puffs", pattern: /\bpuffs?\b/ },
   { canonical: "rusks", pattern: /\brusks?\b/ },
 ];
+
+const SPECIALTY_VARIANTS = new Set(
+  KNOWN_VARIANTS.filter((v) => v.specialty).map((v) => v.canonical)
+);
 
 const STOP_WORDS = new Set([
   "the", "and", "for", "with", "from", "months", "month", "years", "year",
@@ -86,6 +92,14 @@ export function parseProductDNA(rawText: string): ProductDNA {
     .toLowerCase()
     .replace(/[’‘]/g, "'")
     .replace(/\+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Strip per-unit comparison prices (e.g. "$3.89 / 100g", "$0.45 per 1ea", "/ 100ml")
+  // before extracting physical pack weight, volume, or count.
+  const withoutUnitPrices = lower
+    .replace(/\$\s*\d+(?:\.\d+)?\s*(?:\/|per)\s*\d*\s*(?:kg|g|ml|l|ea|each|pack|pk|nappies|wipes)\b/gi, " ")
+    .replace(/(?:\/|\bper)\s*(?:100\s*g|100\s*ml|1\s*kg|1\s*l|1\s*ea|1\s*each|100\s*ea)\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -105,6 +119,11 @@ export function parseProductDNA(rawText: string): ProductDNA {
     }
   }
 
+  const isNappy = /\b(nappy|nappies|swimmers|drynites|pull-ups)\b/.test(lower);
+  const isFormula =
+    !isNappy &&
+    /\b(formula|toddler milk|junior milk|follow-on|follow on|nutritional supplement|junior supplement|milk drink)\b/.test(lower);
+
   // Extract formula stage (1..4)
   let stage: number | null = null;
   const stageMatch =
@@ -112,48 +131,57 @@ export function parseProductDNA(rawText: string): ProductDNA {
     lower.match(/\bgold\s+([1-4])\b/) ??
     lower.match(/\bplatinum\s+([1-4])\b/) ??
     lower.match(/\bstep\s*([1-4])\b/);
-  if (stageMatch) {
+  if (stageMatch && !isNappy) {
     stage = Number(stageMatch[1]);
-  } else if (/\b(newborn|from birth|0\s*[-–to]+\s*6)\b/.test(lower) && /\bformula\b/.test(lower)) {
+  } else if (/\b(newborn|from birth|0\s*[-–to]+\s*6)\b/.test(lower) && isFormula) {
     stage = 1;
-  } else if (/\b(follow\s*[- ]?on|6\s*[-–to]+\s*12)\b/.test(lower) && /\bformula\b/.test(lower)) {
+  } else if (/\b(follow\s*[- ]?on|6\s*[-–to]+\s*12)\b/.test(lower) && isFormula) {
     stage = 2;
-  } else if (/\btoddler\b/.test(lower) && /\b(milk|formula)\b/.test(lower)) {
+  } else if (/\btoddler\b/.test(lower) && /\bfrom\s*2\b/.test(lower) && isFormula) {
+    stage = 4;
+  } else if (/\btoddler\b/.test(lower) && isFormula) {
     stage = 3;
-  } else if (/\bjunior\b/.test(lower) && /\b(milk|formula)\b/.test(lower)) {
+  } else if (/\bjunior\b/.test(lower) && isFormula) {
     stage = 4;
   }
 
-  // Extract nappy size (1..6)
+  // Extract nappy size (1..6), including AU named sizes (Newborn -> 1 ... Junior -> 6)
   let nappySize: number | null = null;
   const sizeMatch = lower.match(/\bsize\s*([1-6])\b/);
-  if (sizeMatch) nappySize = Number(sizeMatch[1]);
+  if (sizeMatch) {
+    nappySize = Number(sizeMatch[1]);
+  } else if (isNappy) {
+    if (/\bnewborn\b/.test(lower)) nappySize = 1;
+    else if (/\binfant\b/.test(lower)) nappySize = 2;
+    else if (/\bcrawler\b/.test(lower)) nappySize = 3;
+    else if (/\btoddler\b/.test(lower)) nappySize = 4;
+    else if (/\bwalker\b/.test(lower)) nappySize = 5;
+    else if (/\bjunior\b/.test(lower)) nappySize = 6;
+  }
 
-  // Extract weight in grams
+  // Extract weight in grams (unit-price-stripped text)
   let grams: number | null = null;
-  const kgMatch = lower.match(/(\d+(?:\.\d+)?)\s*kg\b/);
-  const gMatch = lower.match(/(\d+(?:\.\d+)?)\s*g\b/);
+  const kgMatch = withoutUnitPrices.match(/(\d+(?:\.\d+)?)\s*kg\b/);
+  const gMatch = withoutUnitPrices.match(/(\d+(?:\.\d+)?)\s*g\b/);
   if (kgMatch) {
     grams = Math.round(Number(kgMatch[1]) * 1000);
   } else if (gMatch) {
     grams = Math.round(Number(gMatch[1]));
   }
 
-  // Extract volume in mL
+  // Extract volume in mL (unit-price-stripped text)
   let ml: number | null = null;
-  const mlMatch = lower.match(/(\d+(?:\.\d+)?)\s*ml\b/);
+  const mlMatch = withoutUnitPrices.match(/(\d+(?:\.\d+)?)\s*ml\b/);
   if (mlMatch) ml = Math.round(Number(mlMatch[1]));
 
   // Extract pack count ("54 pack", "48pk", "200 nappies", "224 nappies")
   let packCount: number | null = null;
-  const pkMatch = lower.match(/(\d+)\s*(?:pack|pk|nappies|ea|sachets?)\b/);
+  const pkMatch = withoutUnitPrices.match(/(\d+)\s*(?:pack|pk|nappies|ea|sachets?)\b/);
   if (pkMatch) packCount = Number(pkMatch[1]);
 
   const isSachet =
     /\b(sachet|sachets|travel|single serve|stick pack)\b/.test(lower) ||
-    (packCount !== null && packCount <= 10 && /\bformula\b/.test(lower) && (grams === null || grams < 300));
-  const isFormula = /\b(formula|toddler milk|junior milk|follow-on|follow on)\b/.test(lower);
-  const isNappy = /\b(nappy|nappies|swimmers|drynites|pull-ups)\b/.test(lower);
+    (packCount !== null && packCount <= 10 && isFormula && (grams === null || grams < 300));
   const isOrganic = /\borganic\b/.test(lower);
   const isGoat = /\bgoat\b/.test(lower);
   const isSoy = /\bsoy\b/.test(lower);
@@ -195,15 +223,19 @@ export function matchScore(query: string, candidate: PriceEntry): number {
   // Hard guard 1: brand must match if query specifies a known brand
   if (q.brand && c.brand !== q.brand) return -1;
 
-  // Hard guard 2: sub-line / variant must match if query specifies one (e.g. supremepro != comfort, cosifit != nappy pants)
+  // Hard guard 2: sub-line / variant must match if query specifies one, AND never silently match
+  // a specialty/medical/premium variant (e.g. Lactose Intolerance, Profutura, AllerPro, Nappy Pants)
+  // when the user searched for the standard base line!
   if (q.variant && c.variant && q.variant !== c.variant) return -1;
   if (q.variant && !c.variant) return -1;
+  if (!q.variant && c.variant && SPECIALTY_VARIANTS.has(c.variant)) return -1;
 
   // Hard guard 3: never match sachets/trial packs when user searched for a standard formula tin
   if (c.isSachet && !q.isSachet) return -1;
 
   // Hard guard 4: formula stage must match when specified
   if (q.stage !== null && c.stage !== null && q.stage !== c.stage) return -1;
+  if (q.stage !== null && c.isFormula && c.stage === null) return -1;
 
   // Hard guard 5: nappy size must match when specified
   if (q.nappySize !== null && c.nappySize !== null && q.nappySize !== c.nappySize) return -1;
@@ -211,6 +243,12 @@ export function matchScore(query: string, candidate: PriceEntry): number {
   // Hard guard 6: exclude marketplace bulk cartons (> 120 nappies) unless query asked for bulk
   if (c.isNappy && c.packCount !== null && c.packCount > 120 && !(q.packCount && q.packCount > 120)) {
     return -1;
+  }
+
+  // Hard guard 6b: pack count compatibility when query explicitly specifies a pack count
+  if (q.packCount && c.packCount) {
+    const ratio = Math.min(q.packCount, c.packCount) / Math.max(q.packCount, c.packCount);
+    if (ratio < 0.65) return -1;
   }
 
   // Hard guard 7: goat/soy base must match
@@ -242,7 +280,8 @@ export function matchScore(query: string, candidate: PriceEntry): number {
 
   if (q.isOrganic === c.isOrganic) score += 4;
 
-  if (score < 24) return -1;
+  const minScore = q.brand ? 35 : 24;
+  if (score < minScore) return -1;
   return score;
 }
 

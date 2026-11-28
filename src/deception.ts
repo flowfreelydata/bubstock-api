@@ -15,11 +15,12 @@ import type {
 
 // ─── Google Project Zero (P0) Deception, Honeypots, Ghost Mirage & Canary Engine ─
 
-const DECEPTION_SECRET =
-  process.env.DECEPTION_SECRET ??
-  process.env.ADMIN_API_KEY ??
-  process.env.INGEST_API_KEY ??
-  "bubstock-p0-deception-v3";
+const DECEPTION_SECRET = (() => {
+  const configured = process.env.DECEPTION_SECRET?.trim();
+  if (configured && configured.length >= 16) return configured;
+  console.warn("[security] DECEPTION_SECRET env var not configured — generating ephemeral per-process secret");
+  return crypto.randomBytes(32).toString("hex");
+})();
 
 const MAX_HOSTILE_CACHE = 5_000;
 const MAX_CONCURRENT_TARPITS = 25;
@@ -546,19 +547,19 @@ async function sendSlowDripDecoy(
 
   activeSlowDrips += 1;
   let closed = false;
-  req.on("close", () => {
+  res.on("close", () => {
     closed = true;
   });
 
   try {
     for (let i = 0; i < chunks.length; i++) {
-      if (closed || res.writableEnded) break;
+      if (closed || res.writableEnded || res.destroyed) break;
       res.write(chunks[i]);
       if (i < chunks.length - 1) {
         await new Promise<void>((resolve) => setTimeout(resolve, 650));
       }
     }
-    if (!closed && !res.writableEnded) {
+    if (!res.writableEnded && !res.destroyed) {
       res.end();
     }
   } finally {

@@ -1,3 +1,4 @@
+import { singleflight } from "../cache.js";
 import type {
   AuCity,
   AuStateLower,
@@ -26,19 +27,23 @@ let sessionExpiry = 0;
 
 async function getSession(): Promise<string> {
   if (Date.now() < sessionExpiry && sessionCookie) return sessionCookie;
-  try {
-    const r = await fetch(BASE, {
-      headers: { "User-Agent": UA },
-      signal: AbortSignal.timeout(12_000),
-    });
-    const raw = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];
-    sessionCookie = raw.map((c) => c.split(";")[0]).join("; ");
-    sessionExpiry = Date.now() + 5 * 60 * 1000;
-  } catch (err) {
-    console.warn("[woolworths] session prime failed:", (err as Error).message);
-    sessionCookie = "";
-  }
-  return sessionCookie;
+  return singleflight("woolworths:session", async () => {
+    if (Date.now() < sessionExpiry && sessionCookie) return sessionCookie;
+    try {
+      const r = await fetch(BASE, {
+        headers: { "User-Agent": UA },
+        signal: AbortSignal.timeout(12_000),
+      });
+      const raw = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];
+      sessionCookie = raw.map((c) => c.split(";")[0]).join("; ");
+      sessionExpiry = Date.now() + 5 * 60 * 1000;
+    } catch (err) {
+      console.warn("[woolworths] session prime failed:", (err as Error).message);
+      sessionCookie = "";
+      sessionExpiry = 0;
+    }
+    return sessionCookie;
+  });
 }
 
 interface WoolworthsProduct {
@@ -78,10 +83,10 @@ export async function searchWoolworthsPrices(
   state = "VIC"
 ): Promise<ScraperResult> {
   const t0 = Date.now();
-  const cookie = await getSession();
 
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
+      const cookie = await getSession();
       const qs = new URLSearchParams({
         searchTerm: productName,
         pageSize: "20",
@@ -169,6 +174,7 @@ export async function searchWoolworthsPrices(
     } catch (err) {
       const msg = (err as Error).message;
       if (attempt === 0) {
+        sessionCookie = "";
         sessionExpiry = 0;
         await new Promise((res) => setTimeout(res, 700));
         continue;
@@ -328,6 +334,7 @@ const CITY_STORE_GRIDS: Record<
   AuCity,
   {
     stateUpper: AuStateUpper;
+    acceptedStates: string[];
     stateLower: AuStateLower;
     defaultSuburb: string;
     defaultPostcode: string;
@@ -337,60 +344,86 @@ const CITY_STORE_GRIDS: Record<
 > = {
   melbourne: {
     stateUpper: "VIC",
+    acceptedStates: ["VIC"],
     stateLower: "vic",
     defaultSuburb: "Melbourne",
     defaultPostcode: "3000",
-    bounds: { latMin: -38.30, latMax: -37.50, lonMin: 144.45, lonMax: 145.55 },
+    bounds: { latMin: -39.25, latMax: -33.95, lonMin: 140.95, lonMax: 150.05 },
     grid: [
-      [-37.8136, 144.9631],
-      [-37.7200, 144.9800],
-      [-37.8200, 145.1600],
-      [-37.9200, 145.0800],
-      [-38.0400, 145.2000],
-      [-37.8200, 144.8000],
+      [-37.8136, 144.9631], // Melbourne CBD / North Melbourne
+      [-37.7800, 144.8200], // Sunshine / Footscray / Braybrook / Caroline Springs
+      [-37.8800, 144.7200], // Point Cook / Tarneit / Werribee / Hoppers Crossing
+      [-37.6800, 144.9500], // Craigieburn / Epping / Broadmeadows / Coburg
+      [-37.8200, 145.1800], // Box Hill / Ringwood / Doncaster / Knox
+      [-37.9400, 145.0800], // Bayside / Moorabbin / Chadstone / Dandenong
+      [-38.1200, 145.1800], // Frankston / Cranbourne / Mornington Peninsula
+      [-38.1499, 144.3617], // Geelong / Surf Coast
+      [-37.5622, 143.8503], // Ballarat
+      [-36.7570, 144.2794], // Bendigo
+      [-36.3833, 145.4000], // Shepparton
+      [-38.3830, 142.4880], // Warrnambool
+      [-38.1950, 146.5400], // Traralgon / Gippsland
+      [-36.1214, 146.8881], // Wodonga
+      [-34.1855, 142.1625], // Mildura
     ],
   },
   sydney: {
     stateUpper: "NSW",
+    acceptedStates: ["NSW", "ACT"],
     stateLower: "nsw",
     defaultSuburb: "Sydney",
     defaultPostcode: "2000",
-    bounds: { latMin: -34.18, latMax: -33.55, lonMin: 150.60, lonMax: 151.35 },
+    bounds: { latMin: -37.55, latMax: -28.15, lonMin: 140.95, lonMax: 153.68 },
     grid: [
-      [-33.8688, 151.2093],
-      [-33.8915, 151.2500],
-      [-33.8900, 151.1400],
-      [-33.7970, 151.1800],
-      [-33.7200, 151.2800],
-      [-33.7300, 150.9800],
-      [-33.8150, 151.0000],
-      [-33.7700, 150.8500],
-      [-33.9200, 150.9200],
-      [-33.9670, 151.1030],
-      [-34.0310, 151.0580],
+      [-33.8688, 151.2093], // Sydney CBD / Inner
+      [-33.7970, 151.1800], // North Shore / Chatswood
+      [-33.7200, 151.2800], // Northern Beaches
+      [-33.7300, 150.9800], // Hills / Castle Hill
+      [-33.8150, 151.0000], // Parramatta
+      [-33.7700, 150.8200], // Penrith / Blacktown / Mt Druitt
+      [-33.9200, 150.9200], // Liverpool / Fairfield
+      [-34.0310, 151.0580], // Sutherland / Campbelltown
+      [-34.4278, 150.8931], // Wollongong / Illawarra
+      [-33.4269, 151.3417], // Central Coast / Gosford
+      [-32.9283, 151.7817], // Newcastle / Hunter
+      [-35.2809, 149.1300], // Canberra / Queanbeyan
+      [-35.1082, 147.3598], // Wagga Wagga / Albury
+      [-30.2963, 153.1135], // Coffs Harbour / Port Macquarie
+      [-28.2000, 153.5400], // Tweed / Byron / Northern Rivers
+      [-31.0927, 150.9320], // Tamworth / Dubbo
     ],
   },
   brisbane: {
     stateUpper: "QLD",
+    acceptedStates: ["QLD"],
     stateLower: "qld",
     defaultSuburb: "Brisbane",
     defaultPostcode: "4000",
-    bounds: { latMin: -28.05, latMax: -27.05, lonMin: 152.65, lonMax: 153.55 },
+    bounds: { latMin: -29.20, latMax: -10.50, lonMin: 137.95, lonMax: 153.60 },
     grid: [
       [-27.4698, 153.0251], // Brisbane CBD
       [-27.3200, 153.0200], // North (Chermside / North Lakes)
       [-27.5800, 153.0800], // South (Sunnybank / Mt Gravatt)
-      [-27.6200, 152.7600], // Ipswich / West
+      [-27.6200, 152.7600], // Ipswich / Springfield / West
       [-27.5300, 153.2500], // Redlands / Bayside
       [-27.7200, 153.1500], // Logan
+      [-28.0167, 153.4000], // Gold Coast
+      [-26.6500, 153.0667], // Sunshine Coast
+      [-27.5598, 151.9507], // Toowoomba
+      [-25.2882, 152.8535], // Hervey Bay / Bundaberg
+      [-23.3791, 150.5100], // Rockhampton / Gladstone
+      [-21.1411, 149.1860], // Mackay
+      [-19.2590, 146.8169], // Townsville
+      [-16.9186, 145.7781], // Cairns
     ],
   },
   perth: {
     stateUpper: "WA",
+    acceptedStates: ["WA"],
     stateLower: "wa",
     defaultSuburb: "Perth",
     defaultPostcode: "6000",
-    bounds: { latMin: -32.60, latMax: -31.45, lonMin: 115.60, lonMax: 116.25 },
+    bounds: { latMin: -35.20, latMax: -13.60, lonMin: 112.90, lonMax: 129.05 },
     grid: [
       [-31.9505, 115.8605], // Perth CBD
       [-31.7450, 115.7700], // Joondalup / North
@@ -398,29 +431,42 @@ const CITY_STORE_GRIDS: Record<
       [-32.0569, 115.7439], // Fremantle / Cockburn
       [-32.1500, 115.9500], // Armadale / Canning
       [-32.3500, 115.7500], // Rockingham / Mandurah
+      [-33.3271, 115.6414], // Bunbury / Busselton
+      [-28.7774, 114.6150], // Geraldton
+      [-35.0269, 117.8837], // Albany
+      [-30.7490, 121.4660], // Kalgoorlie
+      [-17.9614, 122.2359], // Broome / Pilbara
     ],
   },
   adelaide: {
     stateUpper: "SA",
+    acceptedStates: ["SA", "NT"],
     stateLower: "sa",
     defaultSuburb: "Adelaide",
     defaultPostcode: "5000",
-    bounds: { latMin: -35.30, latMax: -34.55, lonMin: 138.45, lonMax: 138.85 },
+    bounds: { latMin: -38.10, latMax: -10.90, lonMin: 128.95, lonMax: 141.05 },
     grid: [
       [-34.9285, 138.6007], // Adelaide CBD
-      [-34.7600, 138.6400], // Salisbury / Elizabeth
+      [-34.7600, 138.6400], // Salisbury / Elizabeth / Gawler
       [-34.8600, 138.5200], // Port Adelaide / West
       [-35.0200, 138.5500], // Marion / Glenelg
       [-35.1400, 138.5000], // Noarlunga / South
-      [-35.0100, 138.7300], // Adelaide Hills / Mt Barker
+      [-35.0600, 138.8600], // Adelaide Hills / Mt Barker / Murray Bridge
+      [-35.5525, 138.6216], // Victor Harbor
+      [-37.8284, 140.7804], // Mount Gambier
+      [-33.0333, 137.5667], // Whyalla / Port Augusta / Port Pirie
+      [-34.7240, 135.8586], // Port Lincoln
+      [-12.4634, 130.8456], // Darwin / Palmerston (NT)
+      [-23.6980, 133.8807], // Alice Springs (NT)
     ],
   },
   tasmania: {
     stateUpper: "TAS",
+    acceptedStates: ["TAS"],
     stateLower: "tas",
     defaultSuburb: "Hobart",
     defaultPostcode: "7000",
-    bounds: { latMin: -43.65, latMax: -40.65, lonMin: 144.50, lonMax: 148.50 },
+    bounds: { latMin: -43.75, latMax: -39.50, lonMin: 143.80, lonMax: 148.55 },
     grid: [
       [-42.8821, 147.3272], // Hobart / Glenorchy / Kingston
       [-41.4332, 147.1441], // Launceston
@@ -436,67 +482,76 @@ export async function fetchWoolworthsCityStores(
   const cfg = CITY_STORE_GRIDS[city];
   const cookie = await getSession();
   const byId = new Map<string, MelbourneStore>();
+  const accepted = new Set(cfg.acceptedStates);
 
-  for (const [lat, lon] of cfg.grid) {
-    try {
-      const qs = new URLSearchParams({
-        Max: "45",
-        Division: "SUPERMARKETS",
-        Facility: "",
-        latitude: String(lat),
-        longitude: String(lon),
-      });
-      const r = await fetch(`${STORE_LOCATOR_URL}?${qs.toString()}`, {
-        headers: {
-          "User-Agent": UA,
-          Accept: "application/json",
-          Referer: `${BASE}/shop/storelocator`,
-          ...(cookie ? { Cookie: cookie } : {}),
-        },
-        signal: AbortSignal.timeout(12_000),
-      });
-      if (!r.ok) continue;
-      const data = (await r.json()) as { Stores?: WowRawStore[] };
+  const BATCH = 4;
+  for (let i = 0; i < cfg.grid.length; i += BATCH) {
+    const slice = cfg.grid.slice(i, i + BATCH);
+    await Promise.all(
+      slice.map(async ([lat, lon]) => {
+        try {
+          const qs = new URLSearchParams({
+            Max: "80",
+            Division: "SUPERMARKETS",
+            Facility: "",
+            latitude: String(lat),
+            longitude: String(lon),
+          });
+          const r = await fetch(`${STORE_LOCATOR_URL}?${qs.toString()}`, {
+            headers: {
+              "User-Agent": UA,
+              Accept: "application/json",
+              Referer: `${BASE}/shop/storelocator`,
+              ...(cookie ? { Cookie: cookie } : {}),
+            },
+            signal: AbortSignal.timeout(12_000),
+          });
+          if (!r.ok) return;
+          const data = (await r.json()) as { Stores?: WowRawStore[] };
 
-      for (const s of data.Stores ?? []) {
-        if (!s.StoreNo || (s.State ?? "").toUpperCase() !== cfg.stateUpper) continue;
-        const slat = Number(s.Latitude);
-        const slon = Number(s.Longitude);
-        const b = cfg.bounds;
-        if (
-          !Number.isFinite(slat) ||
-          !Number.isFinite(slon) ||
-          slat < b.latMin ||
-          slat > b.latMax ||
-          slon < b.lonMin ||
-          slon > b.lonMax
-        ) {
-          continue;
+          for (const s of data.Stores ?? []) {
+            const rawSt = (s.State ?? "").toUpperCase();
+            if (!s.StoreNo || !accepted.has(rawSt)) continue;
+            const slat = Number(s.Latitude);
+            const slon = Number(s.Longitude);
+            const b = cfg.bounds;
+            if (
+              !Number.isFinite(slat) ||
+              !Number.isFinite(slon) ||
+              slat < b.latMin ||
+              slat > b.latMax ||
+              slon < b.lonMin ||
+              slon > b.lonMax
+            ) {
+              continue;
+            }
+            const id = `woolworths-${s.StoreNo}`;
+            if (byId.has(id)) continue;
+
+            const addressParts = [s.AddressLine1, s.AddressLine2].filter(Boolean);
+            const resolvedState: AuStateLower = rawSt === "ACT" ? "act" : cfg.stateLower;
+            byId.set(id, {
+              id,
+              retailer: "woolworths",
+              storeNo: s.StoreNo,
+              name: (s.Name ?? s.Suburb ?? "Woolworths").trim(),
+              streetAddress: addressParts.join(", ").trim(),
+              suburb: (s.Suburb ?? cfg.defaultSuburb).trim(),
+              state: resolvedState,
+              postcode: (s.Postcode ?? cfg.defaultPostcode).trim(),
+              latitude: slat,
+              longitude: slon,
+              phone: s.Phone?.trim() || undefined,
+              hours: parseWowHours(s.TradingHours),
+              hasDedicatedBabyAisle: true,
+              source: "woolworths_api",
+            });
+          }
+        } catch (err) {
+          console.warn(`[woolworths] ${city} store grid (${lat},${lon}) failed:`, (err as Error).message);
         }
-        const id = `woolworths-${s.StoreNo}`;
-        if (byId.has(id)) continue;
-
-        const addressParts = [s.AddressLine1, s.AddressLine2].filter(Boolean);
-        byId.set(id, {
-          id,
-          retailer: "woolworths",
-          storeNo: s.StoreNo,
-          name: (s.Name ?? s.Suburb ?? "Woolworths").trim(),
-          streetAddress: addressParts.join(", ").trim(),
-          suburb: (s.Suburb ?? cfg.defaultSuburb).trim(),
-          state: cfg.stateLower,
-          postcode: (s.Postcode ?? cfg.defaultPostcode).trim(),
-          latitude: slat,
-          longitude: slon,
-          phone: s.Phone?.trim() || undefined,
-          hours: parseWowHours(s.TradingHours),
-          hasDedicatedBabyAisle: true,
-          source: "woolworths_api",
-        });
-      }
-    } catch (err) {
-      console.warn(`[woolworths] ${city} store grid (${lat},${lon}) failed:`, (err as Error).message);
-    }
+      })
+    );
   }
 
   return [...byId.values()].sort((a, b) => a.suburb.localeCompare(b.suburb));

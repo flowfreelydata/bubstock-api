@@ -20,6 +20,49 @@ import http2 from "node:http2";
 let cachedJwt = "";
 let cachedJwtExpiry = 0;
 
+let sharedSession: http2.ClientHttp2Session | null = null;
+let sharedSessionHost = "";
+let sessionIdleTimer: NodeJS.Timeout | null = null;
+
+function resetSessionIdleTimer(): void {
+  if (sessionIdleTimer) {
+    clearTimeout(sessionIdleTimer);
+  }
+  sessionIdleTimer = setTimeout(() => {
+    if (sharedSession && !sharedSession.destroyed) {
+      sharedSession.close();
+    }
+    sharedSession = null;
+    sharedSessionHost = "";
+    sessionIdleTimer = null;
+  }, 60_000);
+  sessionIdleTimer.unref();
+}
+
+function getApnsSession(host: string): http2.ClientHttp2Session {
+  if (sharedSession && sharedSessionHost === host && !sharedSession.destroyed && !sharedSession.closed) {
+    resetSessionIdleTimer();
+    return sharedSession;
+  }
+  if (sharedSession && !sharedSession.destroyed) {
+    sharedSession.close();
+  }
+  const client = http2.connect(host);
+  sharedSession = client;
+  sharedSessionHost = host;
+  const clearIfCurrent = () => {
+    if (sharedSession === client) {
+      sharedSession = null;
+      sharedSessionHost = "";
+    }
+  };
+  client.on("close", clearIfCurrent);
+  client.on("goaway", clearIfCurrent);
+  client.on("error", clearIfCurrent);
+  resetSessionIdleTimer();
+  return client;
+}
+
 export function isApnsConfigured(): boolean {
   return Boolean(
     process.env.APNS_KEY_ID &&
@@ -52,14 +95,19 @@ function getApnsJwt(): string | null {
   const payload = base64Url(JSON.stringify({ iss: teamId, iat: now }));
   const unsigned = `${header}.${payload}`;
 
-  const signature = crypto.sign("sha256", Buffer.from(unsigned), {
-    key: rawKey,
-    dsaEncoding: "ieee-p1363",
-  });
+  try {
+    const signature = crypto.sign("sha256", Buffer.from(unsigned), {
+      key: rawKey,
+      dsaEncoding: "ieee-p1363",
+    });
 
-  cachedJwt = `${unsigned}.${base64Url(signature)}`;
-  cachedJwtExpiry = now + 45 * 60;
-  return cachedJwt;
+    cachedJwt = `${unsigned}.${base64Url(signature)}`;
+    cachedJwtExpiry = now + 45 * 60;
+    return cachedJwt;
+  } catch (err) {
+    console.error("[apns] JWT sign failed (check APNS_PRIVATE_KEY):", (err as Error).message);
+    return null;
+  }
 }
 
 export interface ApnsAlertPayload {
@@ -89,7 +137,13 @@ export async function sendApnsPush(
       : "https://api.push.apple.com";
   const topic = process.env.APNS_BUNDLE_ID?.trim() || "au.com.bubstock.app";
 
+  const safeExtraData: Record<string, string> = {};
+  for (const [k, v] of Object.entries(alert.data ?? {})) {
+    if (k !== "aps") safeExtraData[k] = v;
+  }
+
   const body = JSON.stringify({
+    ...safeExtraData,
     aps: {
       alert: {
         title: alert.title,
@@ -98,20 +152,26 @@ export async function sendApnsPush(
       sound: "default",
       "thread-id": alert.threadId ?? "bubstock-deals",
     },
-    ...(alert.data ?? {}),
   });
 
   return new Promise((resolve) => {
-    const client = http2.connect(host);
+    let client: http2.ClientHttp2Session;
+    try {
+      client = getApnsSession(host);
+    } catch (err) {
+      resolve({ ok: false, status: 0, reason: (err as Error).message });
+      return;
+    }
+
     let settled = false;
     const finish = (res: { ok: boolean; status: number; reason?: string }) => {
       if (settled) return;
       settled = true;
-      client.close();
       resolve(res);
     };
 
-    client.on("error", (err) => finish({ ok: false, status: 0, reason: err.message }));
+    const onSessionErr = (err: Error) => finish({ ok: false, status: 0, reason: err.message });
+    client.once("error", onSessionErr);
 
     const req = client.request({
       ":method": "POST",
@@ -123,11 +183,16 @@ export async function sendApnsPush(
       "content-type": "application/json",
     });
 
+    const cleanupAndFinish = (res: { ok: boolean; status: number; reason?: string }) => {
+      client.off("error", onSessionErr);
+      finish(res);
+    };
+
     let status = 0;
     let rawResp = "";
     req.setTimeout(8_000, () => {
       req.close();
-      finish({ ok: false, status: 408, reason: "APNs timeout" });
+      cleanupAndFinish({ ok: false, status: 408, reason: "APNs timeout" });
     });
     req.on("response", (headers) => {
       status = Number(headers[":status"] ?? 0);
@@ -137,7 +202,7 @@ export async function sendApnsPush(
     });
     req.on("end", () => {
       if (status === 200) {
-        finish({ ok: true, status });
+        cleanupAndFinish({ ok: true, status });
       } else {
         let reason = rawResp.slice(0, 120);
         try {
@@ -145,10 +210,10 @@ export async function sendApnsPush(
         } catch {
           // keep raw
         }
-        finish({ ok: false, status, reason });
+        cleanupAndFinish({ ok: false, status, reason });
       }
     });
-    req.on("error", (err) => finish({ ok: false, status: 0, reason: err.message }));
+    req.on("error", (err) => cleanupAndFinish({ ok: false, status: 0, reason: err.message }));
     req.end(body);
   });
 }

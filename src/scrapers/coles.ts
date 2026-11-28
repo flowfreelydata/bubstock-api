@@ -1,3 +1,4 @@
+import { singleflight } from "../cache.js";
 import type { PriceEntry, RetailerFeedStatus, SpecialEntry } from "../types.js";
 
 const BASE = "https://www.coles.com.au";
@@ -16,28 +17,31 @@ let _session: ColesSession = { cookie: "", buildId: null, expiry: 0 };
 
 async function getSession(): Promise<ColesSession> {
   if (Date.now() < _session.expiry && _session.buildId) return _session;
-  try {
-    const r = await fetch(BASE, {
-      headers: {
-        "User-Agent": UA,
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-AU,en;q=0.9",
-      },
-      signal: AbortSignal.timeout(12_000),
-    });
+  return singleflight("coles:session", async () => {
+    if (Date.now() < _session.expiry && _session.buildId) return _session;
+    try {
+      const r = await fetch(BASE, {
+        headers: {
+          "User-Agent": UA,
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          "Accept-Language": "en-AU,en;q=0.9",
+        },
+        signal: AbortSignal.timeout(12_000),
+      });
 
-    const raw = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];
-    const cookie = raw.map((c) => c.split(";")[0]).join("; ");
-    const html = await r.text();
-    const match = html.match(/"buildId":"([^"]+)"/);
-    const buildId = match?.[1] ?? null;
+      const raw = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];
+      const cookie = raw.map((c) => c.split(";")[0]).join("; ");
+      const html = await r.text();
+      const match = html.match(/"buildId":"([^"]+)"/);
+      const buildId = match?.[1] ?? null;
 
-    _session = { cookie, buildId, expiry: Date.now() + 5 * 60 * 1000 };
-  } catch (err) {
-    console.warn("[coles] session prime failed:", (err as Error).message);
-    _session = { cookie: "", buildId: null, expiry: Date.now() + 60_000 };
-  }
-  return _session;
+      _session = { cookie, buildId, expiry: Date.now() + 5 * 60 * 1000 };
+    } catch (err) {
+      console.warn("[coles] session prime failed:", (err as Error).message);
+      _session = { cookie: "", buildId: null, expiry: Date.now() + 60_000 };
+    }
+    return _session;
+  });
 }
 
 interface ColesProduct {

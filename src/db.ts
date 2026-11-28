@@ -20,9 +20,12 @@ export const pool = hasDbUrl
       ssl: process.env.DATABASE_URL?.includes("railway.internal")
         ? false
         : { rejectUnauthorized: process.env.PG_SSL_ALLOW_SELF_SIGNED !== "true" },
-      max: 6,
+      max: 10,
       idleTimeoutMillis: 20_000,
       connectionTimeoutMillis: 5_000,
+      statement_timeout: 8_000,
+      query_timeout: 10_000,
+      allowExitOnIdle: true,
     })
   : null;
 
@@ -148,16 +151,25 @@ export async function initSchema(): Promise<void> {
       );
 
       ALTER TABLE shelf_sightings ADD COLUMN IF NOT EXISTS device_hash TEXT;
+      ALTER TABLE shelf_sightings ADD COLUMN IF NOT EXISTS ip_hash TEXT;
+      ALTER TABLE shelf_sightings ADD COLUMN IF NOT EXISTS hw_key_id TEXT;
       ALTER TABLE shelf_sightings ADD COLUMN IF NOT EXISTS is_shadow_banned BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE shelf_sightings ADD COLUMN IF NOT EXISTS au_state TEXT;
 
       CREATE INDEX IF NOT EXISTS idx_sightings_product_store
         ON shelf_sightings(product_id, store_id, reported_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_sightings_ip_recent
+        ON shelf_sightings(ip_hash, reported_at DESC);
 
       CREATE INDEX IF NOT EXISTS idx_sightings_recent
         ON shelf_sightings(reported_at DESC);
 
       CREATE INDEX IF NOT EXISTS idx_sightings_visible
         ON shelf_sightings(is_shadow_banned, reported_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_sightings_state
+        ON shelf_sightings(au_state, reported_at DESC);
 
       CREATE TABLE IF NOT EXISTS social_promos (
         id            TEXT PRIMARY KEY,
@@ -201,36 +213,64 @@ export async function initSchema(): Promise<void> {
         ON sent_push_alerts(sent_at DESC);
 
       CREATE TABLE IF NOT EXISTS household_vaults (
-        vault_id        TEXT PRIMARY KEY,
+        vault_id         TEXT PRIMARY KEY,
         write_token_hash TEXT,
-        ciphertext      TEXT NOT NULL,
-        updated_at      TIMESTAMPTZ DEFAULT NOW()
+        read_token_hash  TEXT,
+        owner_key_id     TEXT,
+        ciphertext       TEXT NOT NULL,
+        updated_at       TIMESTAMPTZ DEFAULT NOW()
       );
 
       ALTER TABLE household_vaults ADD COLUMN IF NOT EXISTS write_token_hash TEXT;
+      ALTER TABLE household_vaults ADD COLUMN IF NOT EXISTS read_token_hash TEXT;
+      ALTER TABLE household_vaults ADD COLUMN IF NOT EXISTS owner_key_id TEXT;
 
       CREATE TABLE IF NOT EXISTS mothers_groups (
-        group_code      TEXT PRIMARY KEY,
-        suburb          TEXT NOT NULL,
-        city            TEXT NOT NULL,
-        member_hashes   TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        group_code       TEXT PRIMARY KEY,
+        suburb           TEXT NOT NULL,
+        city             TEXT NOT NULL,
+        member_hashes    TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
         member_ip_hashes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-        created_at      TIMESTAMPTZ DEFAULT NOW()
+        member_hw_hashes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        created_at       TIMESTAMPTZ DEFAULT NOW()
       );
 
       ALTER TABLE mothers_groups ADD COLUMN IF NOT EXISTS member_ip_hashes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
+      ALTER TABLE mothers_groups ADD COLUMN IF NOT EXISTS member_hw_hashes TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
 
       CREATE TABLE IF NOT EXISTS referral_codes (
-        code              TEXT PRIMARY KEY,
-        owner_device_hash TEXT NOT NULL,
-        redeemer_hashes   TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
-        created_at        TIMESTAMPTZ DEFAULT NOW()
+        code                   TEXT PRIMARY KEY,
+        owner_device_hash      TEXT NOT NULL,
+        owner_hw_hash          TEXT,
+        redeemer_hashes        TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        last_reward_expires_at TIMESTAMPTZ,
+        created_at             TIMESTAMPTZ DEFAULT NOW()
       );
+
+      ALTER TABLE referral_codes ADD COLUMN IF NOT EXISTS owner_hw_hash TEXT;
+      ALTER TABLE referral_codes ADD COLUMN IF NOT EXISTS last_reward_expires_at TIMESTAMPTZ;
 
       CREATE TABLE IF NOT EXISTS device_promo_claims (
         device_hash TEXT PRIMARY KEY,
         kind        TEXT NOT NULL,
-        claimed_at  TIMESTAMPTZ DEFAULT NOW()
+        claimed_at  TIMESTAMPTZ DEFAULT NOW(),
+        expires_at  TIMESTAMPTZ
+      );
+
+      ALTER TABLE device_promo_claims ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+
+      CREATE TABLE IF NOT EXISTS storekit_transaction_devices (
+        original_transaction_id TEXT NOT NULL,
+        device_hash             TEXT NOT NULL,
+        first_seen_at           TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (original_transaction_id, device_hash)
+      );
+
+      CREATE TABLE IF NOT EXISTS device_key_bindings (
+        device_hash   TEXT NOT NULL,
+        key_id        TEXT NOT NULL,
+        first_seen_at TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (device_hash, key_id)
       );
 
       CREATE TABLE IF NOT EXISTS attested_keys (
@@ -275,6 +315,65 @@ export async function initSchema(): Promise<void> {
         is_banned   BOOLEAN NOT NULL DEFAULT FALSE,
         reason      TEXT NOT NULL,
         updated_at  TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS safeshop_links (
+        token             TEXT PRIMARY KEY,
+        owner_key_id      TEXT NOT NULL,
+        suburb            TEXT NOT NULL,
+        state             TEXT NOT NULL,
+        stage_label       TEXT NOT NULL,
+        avoided_allergens TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        items_json        JSONB NOT NULL,
+        recall_clear      BOOLEAN NOT NULL DEFAULT TRUE,
+        expires_at        TIMESTAMPTZ NOT NULL,
+        created_at        TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_safeshop_expires
+        ON safeshop_links(expires_at);
+
+      CREATE TABLE IF NOT EXISTS formula_relays (
+        id           TEXT PRIMARY KEY,
+        owner_key_id TEXT NOT NULL,
+        product_id   TEXT NOT NULL,
+        product_name TEXT NOT NULL,
+        suburb       TEXT NOT NULL,
+        au_state     TEXT NOT NULL DEFAULT 'VIC',
+        lat_coarse   DOUBLE PRECISION NOT NULL,
+        lon_coarse   DOUBLE PRECISION NOT NULL,
+        note         TEXT,
+        status       TEXT NOT NULL DEFAULT 'open',
+        expires_at   TIMESTAMPTZ NOT NULL,
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_formula_relays_active
+        ON formula_relays(status, expires_at DESC);
+
+      CREATE TABLE IF NOT EXISTS formula_relay_replies (
+        id            TEXT PRIMARY KEY,
+        relay_id      TEXT NOT NULL REFERENCES formula_relays(id) ON DELETE CASCADE,
+        helper_key_id TEXT NOT NULL,
+        store_name    TEXT NOT NULL,
+        suburb        TEXT NOT NULL,
+        note          TEXT,
+        created_at    TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_relay_replies_relay
+        ON formula_relay_replies(relay_id, created_at DESC);
+
+      -- Clear any historical false-positive velocity/replay IP bans so legitimate parents
+      -- and shared Australian CGNAT networks are never blocked or misrouted.
+      DELETE FROM hostile_fingerprints
+      WHERE reason IN (
+        'unattested_velocity_scrape',
+        'soft_key_velocity_scrape',
+        'replay_stale_timestamp',
+        'counter_rollback_replay',
+        'invalid_hardware_signature',
+        'automated_scraper_ua'
       );
     `);
     console.log("[db] schema ready");
@@ -347,7 +446,7 @@ export async function getFreshRetailerPrices(
   try {
     const escapedTokens = tokens.map(escapeLikePattern);
     const tokenClauses = escapedTokens.map(
-      (_t, i) => `(lower(product_name) LIKE '%' || $${i + 3} || '%' ESCAPE '\\' OR lower(matched_name) LIKE '%' || $${i + 3} || '%' ESCAPE '\\')`
+      (_t, i) => `(lower(product_name) LIKE '%' || $${i + 4} || '%' ESCAPE '\\' OR lower(matched_name) LIKE '%' || $${i + 4} || '%' ESCAPE '\\')`
     );
     const result = await pool.query(
       `SELECT DISTINCT ON (COALESCE(stockcode, lower(matched_name)))
@@ -364,7 +463,7 @@ export async function getFreshRetailerPrices(
          )
        ORDER BY COALESCE(stockcode, lower(matched_name)), fetched_at DESC
        LIMIT 16`,
-      [retailer, maxAgeHours, ...escapedTokens]
+      [retailer, maxAgeHours, clean, ...escapedTokens]
     );
 
     return result.rows.map((r) => {
@@ -652,7 +751,10 @@ export async function upsertRecalls(recalls: RecallEntry[]): Promise<void> {
   if (!pool || recalls.length === 0) return;
   const client = await pool.connect();
   try {
+    await client.query("BEGIN");
+    const activeIds: string[] = [];
     for (const r of recalls) {
+      activeIds.push(r.id);
       await client.query(
         `INSERT INTO recall_entries
            (fsanz_id, agency, product_name, brand, recall_date, reason,
@@ -685,7 +787,19 @@ export async function upsertRecalls(recalls: RecallEntry[]): Promise<void> {
         ]
       );
     }
+    // Expire removed/archived recalls when we received a full upstream feed snapshot
+    if (activeIds.length >= 5) {
+      await client.query(
+        `UPDATE recall_entries
+         SET is_active = FALSE
+         WHERE is_active = TRUE
+           AND NOT (fsanz_id = ANY($1::text[]))`,
+        [activeIds]
+      );
+    }
+    await client.query("COMMIT");
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
     console.error("[db] upsertRecalls error:", (err as Error).message);
   } finally {
     client.release();
@@ -771,11 +885,14 @@ export interface NewSightingInput {
   storeId: string;
   storeName: string;
   suburb: string;
+  auState?: string;
   retailer: string;
   state: StockStateValue;
   observedPrice?: number;
   note?: string;
   deviceId?: string;
+  ipHash?: string;
+  hwKeyId?: string;
   isShadowBanned?: boolean;
 }
 
@@ -786,7 +903,10 @@ export function hashDeviceId(deviceId?: string): string | undefined {
 
 interface InternalMemorySighting extends ShelfSighting {
   deviceHash?: string;
+  ipHash?: string;
+  hwKeyId?: string;
   isShadowBanned?: boolean;
+  auState?: string;
 }
 const memorySightingsWithHash: InternalMemorySighting[] = memorySightings;
 
@@ -794,7 +914,10 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
   const id = crypto.randomUUID();
   const reportedAt = new Date().toISOString();
   const deviceHash = hashDeviceId(input.deviceId);
+  const ipHash = input.ipHash?.trim().slice(0, 32) || undefined;
+  const hwKeyId = input.hwKeyId?.trim().slice(0, 40) || undefined;
   const shadow = Boolean(input.isShadowBanned);
+  const cleanAuState = input.auState ? input.auState.toUpperCase().slice(0, 6) : "VIC";
   const sighting: ShelfSighting = {
     id,
     productId: input.productId,
@@ -812,7 +935,7 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
   };
 
   if (!pool) {
-    memorySightingsWithHash.unshift({ ...sighting, deviceHash, isShadowBanned: shadow });
+    memorySightingsWithHash.unshift({ ...sighting, deviceHash, ipHash, hwKeyId, isShadowBanned: shadow, auState: cleanAuState });
     if (memorySightingsWithHash.length > 1000) memorySightingsWithHash.pop();
     const cutoff = Date.now() - 12 * 3600 * 1000;
     const reporters = new Set(
@@ -825,7 +948,8 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
             s.state === sighting.state &&
             new Date(s.reportedAt).getTime() >= cutoff
         )
-        .map((s) => s.deviceHash ?? s.id)
+        // Sybil-resistant actor identity: hardware key -> IP hash -> device hash
+        .map((s) => s.hwKeyId ?? s.ipHash ?? s.deviceHash ?? s.id)
     );
     sighting.corroborationCount = Math.max(1, reporters.size);
     sighting.verifiedByCommunity = sighting.corroborationCount >= 2;
@@ -834,8 +958,8 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
 
   await pool.query(
     `INSERT INTO shelf_sightings
-       (id, product_id, product_name, store_id, store_name, suburb, retailer, state, observed_price, note, device_hash, is_shadow_banned, reported_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+       (id, product_id, product_name, store_id, store_name, suburb, au_state, retailer, state, observed_price, note, device_hash, ip_hash, hw_key_id, is_shadow_banned, reported_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
     [
       sighting.id,
       sighting.productId,
@@ -843,19 +967,22 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
       sighting.storeId,
       sighting.storeName,
       sighting.suburb,
+      cleanAuState,
       sighting.retailer,
       sighting.state,
       sighting.observedPrice ?? null,
       sighting.note ?? null,
       deviceHash ?? null,
+      ipHash ?? null,
+      hwKeyId ?? null,
       shadow,
       sighting.reportedAt,
     ]
   );
 
-  // Count distinct non-shadow-banned local parents agreeing on this product/store/state within 12 hours
+  // Sybil-resistant corroboration: count distinct (hardware key / IP / device) actors, never letting rotated deviceIds self-corroborate
   const corr = await pool.query(
-    `SELECT COUNT(DISTINCT COALESCE(device_hash, id))::INT AS cnt
+    `SELECT COUNT(DISTINCT COALESCE(hw_key_id, ip_hash, device_hash, id))::INT AS cnt
      FROM shelf_sightings
      WHERE product_id = $1
        AND store_id = $2
@@ -874,6 +1001,7 @@ export async function saveSighting(input: NewSightingInput): Promise<ShelfSighti
 export async function getSightings(opts: {
   productId?: string;
   storeId?: string;
+  auState?: string;
   hours?: number;
   limit?: number;
   viewerDeviceId?: string;
@@ -881,6 +1009,7 @@ export async function getSightings(opts: {
   const hours = Math.min(Math.max(opts.hours ?? 72, 1), 168);
   const limit = Math.min(Math.max(opts.limit ?? 100, 1), 250);
   const viewerHash = hashDeviceId(opts.viewerDeviceId);
+  const auState = opts.auState ? opts.auState.toUpperCase() : undefined;
 
   if (!pool) {
     const cutoff = Date.now() - hours * 3600 * 1000;
@@ -890,6 +1019,7 @@ export async function getSightings(opts: {
       .filter((s) => !s.isShadowBanned || (viewerHash !== undefined && s.deviceHash === viewerHash))
       .filter((s) => !opts.productId || s.productId === opts.productId)
       .filter((s) => !opts.storeId || s.storeId === opts.storeId)
+      .filter((s) => !auState || opts.storeId || (s.auState ?? "VIC") === auState)
       .slice(0, limit);
 
     const groups = new Map<string, Set<string>>();
@@ -940,6 +1070,10 @@ export async function getSightings(opts: {
   if (opts.storeId) {
     params.push(opts.storeId);
     conditions.push(`store_id = $${params.length}`);
+  }
+  if (auState && !opts.storeId) {
+    params.push(auState);
+    conditions.push(`COALESCE(au_state, 'VIC') = $${params.length}`);
   }
   params.push(limit);
 
@@ -1028,14 +1162,17 @@ export async function saveSocialPromo(input: {
   referralCode?: string;
   city?: string;
   deviceId?: string;
+  hwKeyId?: string;
 }): Promise<{ duplicate: boolean; alreadyClaimedByDevice?: boolean; record?: SocialPromoRecord }> {
   const id = crypto.randomUUID();
   const submittedAt = new Date().toISOString();
   const devHash = hashDeviceId(input.deviceId);
+  const hwHash = input.hwKeyId ? hashDeviceId(`hw:${input.hwKeyId}`) : undefined;
   const record: SocialPromoRecord = { id, platform: input.platform, postUrl: input.postUrl, referralCode: input.referralCode, city: input.city, submittedAt };
+  const expiryMs = Date.now() + 62 * 86_400_000;
 
   if (!pool) {
-    if (devHash && memoryDeviceClaims.has(devHash)) {
+    if ((devHash && memoryDeviceClaims.has(devHash)) || (hwHash && memoryDeviceClaims.has(hwHash))) {
       return { duplicate: true, alreadyClaimedByDevice: true };
     }
     if (memoryPromos.some((p) => p.postUrl.toLowerCase() === input.postUrl.toLowerCase())) {
@@ -1043,39 +1180,61 @@ export async function saveSocialPromo(input: {
     }
     memoryPromos.unshift(record);
     if (memoryPromos.length > 500) memoryPromos.pop();
-    if (devHash) memoryDeviceClaims.add(devHash);
+    if (devHash) memoryDeviceClaims.set(devHash, expiryMs);
+    if (hwHash) memoryDeviceClaims.set(hwHash, expiryMs);
     return { duplicate: false, record };
   }
 
-  if (devHash) {
-    const existing = await pool.query(
-      `SELECT 1 FROM social_promos WHERE device_hash = $1 LIMIT 1`,
-      [devHash]
-    );
-    if ((existing.rowCount ?? 0) > 0) {
-      return { duplicate: true, alreadyClaimedByDevice: true };
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Enforce single free preview claim across ALL promo types & hardware keys (no stacking or UUID rotation)
+    const hashesToClaim = [devHash, hwHash].filter((h): h is string => Boolean(h));
+    if (hashesToClaim.length > 0) {
+      const existing = await client.query(
+        `SELECT 1 FROM device_promo_claims WHERE device_hash = ANY($1::text[]) LIMIT 1`,
+        [hashesToClaim]
+      );
+      if ((existing.rowCount ?? 0) > 0) {
+        await client.query("ROLLBACK");
+        return { duplicate: true, alreadyClaimedByDevice: true };
+      }
     }
-  }
 
-  const res = await pool.query(
-    `INSERT INTO social_promos (id, platform, post_url, referral_code, city, device_hash, submitted_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7)
-     ON CONFLICT (post_url) DO NOTHING
-     RETURNING id`,
-    [id, input.platform, input.postUrl, input.referralCode ?? null, input.city ?? null, devHash ?? null, submittedAt]
-  );
+    const res = await client.query(
+      `INSERT INTO social_promos (id, platform, post_url, referral_code, city, device_hash, submitted_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)
+       ON CONFLICT (post_url) DO NOTHING
+       RETURNING id`,
+      [id, input.platform, input.postUrl, input.referralCode ?? null, input.city ?? null, devHash ?? null, submittedAt]
+    );
+    if (res.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return { duplicate: true };
+    }
 
-  if (res.rowCount === 0) {
-    return { duplicate: true };
-  }
+    for (const h of hashesToClaim) {
+      const claimInsert = await client.query(
+        `INSERT INTO device_promo_claims (device_hash, kind, expires_at)
+         VALUES ($1, $2, NOW() + INTERVAL '62 days')
+         ON CONFLICT (device_hash) DO NOTHING
+         RETURNING device_hash`,
+        [h, h === hwHash ? "social_hw" : "social"]
+      );
+      if ((claimInsert.rowCount ?? 0) === 0) {
+        await client.query("ROLLBACK");
+        return { duplicate: true, alreadyClaimedByDevice: true };
+      }
+    }
 
-  if (devHash) {
-    await pool.query(
-      `INSERT INTO device_promo_claims (device_hash, kind) VALUES ($1, 'social') ON CONFLICT (device_hash) DO NOTHING`,
-      [devHash]
-    ).catch(() => {});
+    await client.query("COMMIT");
+    return { duplicate: false, record };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
-  return { duplicate: false, record };
 }
 
 export async function getRecentSocialPromos(limit = 50): Promise<SocialPromoRecord[]> {
@@ -1130,17 +1289,20 @@ const memorySentKeys = new Set<string>();
 export async function upsertPushSubscription(
   sub: Omit<PushSubscriptionRecord, "updatedAt">
 ): Promise<{ ok: boolean; forbidden?: boolean }> {
+  if (!sub.ownerKeyId) {
+    return { ok: false, forbidden: true };
+  }
   const updatedAt = new Date().toISOString();
 
   if (!pool) {
     const existing = memoryPushSubs.get(sub.deviceId);
-    // Strict IDOR protection: once bound to a hardware key, unattested OR mismatched callers are rejected
-    if (existing?.ownerKeyId && existing.ownerKeyId !== sub.ownerKeyId) {
+    // Strict IDOR protection: reject updates if existing row has no owner or belongs to another key
+    if (existing && (!existing.ownerKeyId || existing.ownerKeyId !== sub.ownerKeyId)) {
       return { ok: false, forbidden: true };
     }
     const full: PushSubscriptionRecord = {
       ...sub,
-      ownerKeyId: existing?.ownerKeyId ?? sub.ownerKeyId,
+      ownerKeyId: sub.ownerKeyId,
       updatedAt,
     };
     memoryPushSubs.set(sub.deviceId, full);
@@ -1151,9 +1313,11 @@ export async function upsertPushSubscription(
     `SELECT owner_key_id FROM push_subscriptions WHERE device_id = $1`,
     [sub.deviceId]
   );
-  const storedOwner = existing.rows[0]?.owner_key_id ? String(existing.rows[0].owner_key_id) : undefined;
-  if (storedOwner && storedOwner !== sub.ownerKeyId) {
-    return { ok: false, forbidden: true };
+  if (existing.rows.length > 0) {
+    const storedOwner = existing.rows[0]?.owner_key_id ? String(existing.rows[0].owner_key_id) : undefined;
+    if (!storedOwner || storedOwner !== sub.ownerKeyId) {
+      return { ok: false, forbidden: true };
+    }
   }
 
   await pool.query(
@@ -1161,7 +1325,6 @@ export async function upsertPushSubscription(
        (device_id, owner_key_id, apns_token, city, state, has_plus, half_price_enabled, min_discount_percent, alert_categories, watched_rules, updated_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
      ON CONFLICT (device_id) DO UPDATE SET
-       owner_key_id         = COALESCE(push_subscriptions.owner_key_id, EXCLUDED.owner_key_id),
        apns_token           = COALESCE(EXCLUDED.apns_token, push_subscriptions.apns_token),
        city                 = EXCLUDED.city,
        state                = EXCLUDED.state,
@@ -1170,10 +1333,11 @@ export async function upsertPushSubscription(
        min_discount_percent = EXCLUDED.min_discount_percent,
        alert_categories     = EXCLUDED.alert_categories,
        watched_rules        = EXCLUDED.watched_rules,
-       updated_at           = EXCLUDED.updated_at`,
+       updated_at           = EXCLUDED.updated_at
+     WHERE push_subscriptions.owner_key_id = EXCLUDED.owner_key_id`,
     [
       sub.deviceId,
-      sub.ownerKeyId ?? null,
+      sub.ownerKeyId,
       sub.apnsToken ?? null,
       sub.city,
       sub.state,
@@ -1267,12 +1431,20 @@ export async function clearInvalidApnsToken(deviceId: string): Promise<void> {
   await pool.query(`UPDATE push_subscriptions SET apns_token = NULL WHERE device_id = $1`, [deviceId]);
 }
 
-// ─── Zero-Knowledge E2EE Two-Parent Household Vault (Write-Proof Protected) ──
+// ─── Zero-Knowledge E2EE Two-Parent Household Vault (Write + Read Proof Protected) ──
 
-const memoryVaults = new Map<string, { ciphertext: string; writeTokenHash: string; updatedAt: string }>();
+const memoryVaults = new Map<
+  string,
+  { ciphertext: string; writeTokenHash: string; readTokenHash: string; ownerKeyId: string; updatedAt: string }
+>();
+const MAX_VAULTS_PER_KEY = 5;
 
 function hashSecretToken(token: string): string {
   return crypto.createHash("sha256").update(`bubstock-vault-write-v1:${token}`).digest("hex");
+}
+
+function hashReadToken(token: string): string {
+  return crypto.createHash("sha256").update(`bubstock-vault-read-v1:${token}`).digest("hex");
 }
 
 function safeHexEqual(a: string, b: string): boolean {
@@ -1283,40 +1455,72 @@ function safeHexEqual(a: string, b: string): boolean {
 export async function upsertHouseholdVault(
   vaultId: string,
   writeToken: string,
-  ciphertext: string
-): Promise<{ ok: boolean; forbidden?: boolean; storageFull?: boolean; updatedAt?: string }> {
+  readToken: string,
+  ciphertext: string,
+  ownerKeyId: string
+): Promise<{ ok: boolean; forbidden?: boolean; storageFull?: boolean; quotaExceeded?: boolean; updatedAt?: string }> {
   const tokenHash = hashSecretToken(writeToken);
+  const readHash = hashReadToken(readToken);
   const updatedAt = new Date().toISOString();
 
   if (!pool) {
     const existing = memoryVaults.get(vaultId);
-    if (existing && !safeHexEqual(existing.writeTokenHash, tokenHash)) {
-      return { ok: false, forbidden: true };
+    if (existing) {
+      if (!existing.writeTokenHash || !safeHexEqual(existing.writeTokenHash, tokenHash)) {
+        return { ok: false, forbidden: true };
+      }
+      memoryVaults.set(vaultId, {
+        ciphertext,
+        writeTokenHash: existing.writeTokenHash,
+        readTokenHash: existing.readTokenHash || readHash,
+        ownerKeyId: existing.ownerKeyId,
+        updatedAt,
+      });
+      return { ok: true, updatedAt };
     }
-    if (!existing && memoryVaults.size >= 5000) {
+    let keyVaultCount = 0;
+    for (const v of memoryVaults.values()) {
+      if (v.ownerKeyId === ownerKeyId) keyVaultCount++;
+    }
+    if (keyVaultCount >= MAX_VAULTS_PER_KEY) {
+      return { ok: false, quotaExceeded: true };
+    }
+    if (memoryVaults.size >= 5000) {
       return { ok: false, storageFull: true };
     }
-    memoryVaults.set(vaultId, { ciphertext, writeTokenHash: tokenHash, updatedAt });
+    memoryVaults.set(vaultId, { ciphertext, writeTokenHash: tokenHash, readTokenHash: readHash, ownerKeyId, updatedAt });
     return { ok: true, updatedAt };
   }
 
   const existing = await pool.query(
-    `SELECT write_token_hash FROM household_vaults WHERE vault_id = $1`,
+    `SELECT write_token_hash, read_token_hash FROM household_vaults WHERE vault_id = $1`,
     [vaultId]
   );
 
   if (existing.rows.length > 0) {
     const storedHash = String(existing.rows[0].write_token_hash ?? "");
-    if (storedHash && !safeHexEqual(storedHash, tokenHash)) {
+    // Fail-closed: reject legacy NULL write_token_hash rows as well as mismatched proofs
+    if (!storedHash || !safeHexEqual(storedHash, tokenHash)) {
       return { ok: false, forbidden: true };
     }
     await pool.query(
       `UPDATE household_vaults
-       SET ciphertext = $2, write_token_hash = COALESCE(write_token_hash, $3), updated_at = NOW()
+       SET ciphertext = $2,
+           read_token_hash = COALESCE(read_token_hash, $3),
+           updated_at = NOW()
        WHERE vault_id = $1`,
-      [vaultId, ciphertext, tokenHash]
+      [vaultId, ciphertext, readHash]
     );
     return { ok: true, updatedAt };
+  }
+
+  // Per-hardware-key quota prevents any attested attacker from exhausting the global 50k vault ceiling
+  const keyCntRes = await pool.query(
+    `SELECT COUNT(*)::INT AS cnt FROM household_vaults WHERE owner_key_id = $1`,
+    [ownerKeyId]
+  );
+  if ((keyCntRes.rows[0]?.cnt ?? 0) >= MAX_VAULTS_PER_KEY) {
+    return { ok: false, quotaExceeded: true };
   }
 
   // Prune abandoned vaults (>180 days untouched) & enforce storage safety ceiling
@@ -1327,135 +1531,296 @@ export async function upsertHouseholdVault(
   }
 
   await pool.query(
-    `INSERT INTO household_vaults (vault_id, write_token_hash, ciphertext, updated_at)
-     VALUES ($1, $2, $3, NOW())`,
-    [vaultId, tokenHash, ciphertext]
+    `INSERT INTO household_vaults (vault_id, write_token_hash, read_token_hash, owner_key_id, ciphertext, updated_at)
+     VALUES ($1, $2, $3, $4, $5, NOW())`,
+    [vaultId, tokenHash, readHash, ownerKeyId, ciphertext]
   );
   return { ok: true, updatedAt };
 }
 
-export async function getHouseholdVault(vaultId: string): Promise<{ ciphertext: string; updatedAt: string } | null> {
+export async function getHouseholdVault(
+  vaultId: string,
+  readToken: string
+): Promise<{ vault: { ciphertext: string; updatedAt: string } | null; forbidden?: boolean }> {
+  const readHash = hashReadToken(readToken);
   if (!pool) {
     const v = memoryVaults.get(vaultId);
-    return v ? { ciphertext: v.ciphertext, updatedAt: v.updatedAt } : null;
+    if (!v) return { vault: null };
+    if (!v.readTokenHash || !safeHexEqual(v.readTokenHash, readHash)) {
+      return { vault: null, forbidden: true };
+    }
+    return { vault: { ciphertext: v.ciphertext, updatedAt: v.updatedAt } };
   }
   const r = await pool.query(
-    `SELECT ciphertext, updated_at FROM household_vaults WHERE vault_id = $1`,
+    `SELECT ciphertext, read_token_hash, updated_at FROM household_vaults WHERE vault_id = $1`,
     [vaultId]
   );
-  if (r.rows.length === 0) return null;
+  if (r.rows.length === 0) return { vault: null };
+  const storedReadHash = String(r.rows[0].read_token_hash ?? "");
+  if (!storedReadHash || !safeHexEqual(storedReadHash, readHash)) {
+    return { vault: null, forbidden: true };
+  }
   return {
-    ciphertext: String(r.rows[0].ciphertext),
-    updatedAt: new Date(r.rows[0].updated_at).toISOString(),
+    vault: {
+      ciphertext: String(r.rows[0].ciphertext),
+      updatedAt: new Date(r.rows[0].updated_at).toISOString(),
+    },
   };
 }
 
 // ─── Server-Verified Referral Codes & Entitlement Proofs ─────────────────────
 
-const memoryReferrals = new Map<string, { ownerHash: string; redeemers: Set<string> }>();
-const memoryDeviceClaims = new Set<string>();
+const memoryReferrals = new Map<
+  string,
+  { ownerHash: string; ownerHwHash?: string; redeemers: Set<string>; lastRewardExpiresAtMs?: number }
+>();
+const memoryDeviceClaims = new Map<string, number>();
+const memoryStoreKitDevices = new Map<string, Set<string>>();
+const memoryDeviceKeyBindings = new Map<string, Set<string>>();
 
-export async function registerReferralCode(code: string, deviceId: string): Promise<void> {
+export async function bindAndVerifyDeviceKey(
+  deviceId: string,
+  keyId: string,
+  maxKeys = 2
+): Promise<boolean> {
+  const devHash = hashDeviceId(deviceId);
+  const cleanKey = keyId.trim();
+  if (!devHash || !cleanKey) return false;
+
+  if (!pool) {
+    let set = memoryDeviceKeyBindings.get(devHash);
+    if (!set) {
+      set = new Set<string>();
+      memoryDeviceKeyBindings.set(devHash, set);
+    }
+    if (set.has(cleanKey)) return true;
+    if (set.size >= maxKeys) return false;
+    set.add(cleanKey);
+    return true;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query(
+      `SELECT key_id FROM device_key_bindings
+       WHERE device_hash = $1
+       FOR UPDATE`,
+      [devHash]
+    );
+    const known = existing.rows.map((r) => String(r.key_id));
+    if (known.includes(cleanKey)) {
+      await client.query("COMMIT");
+      return true;
+    }
+    if (known.length >= maxKeys) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+    await client.query(
+      `INSERT INTO device_key_bindings (device_hash, key_id)
+       VALUES ($1, $2)
+       ON CONFLICT (device_hash, key_id) DO NOTHING`,
+      [devHash, cleanKey]
+    );
+    await client.query("COMMIT");
+    return true;
+  } catch {
+    await client.query("ROLLBACK").catch(() => {});
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
+export async function checkAndRecordStoreKitDevice(
+  originalTransactionId: string | undefined,
+  deviceId: string,
+  maxDevices = 6
+): Promise<boolean> {
+  if (!originalTransactionId) return true;
+  const devHash = hashDeviceId(deviceId);
+  if (!devHash) return false;
+
+  if (!pool) {
+    let set = memoryStoreKitDevices.get(originalTransactionId);
+    if (!set) {
+      set = new Set<string>();
+      memoryStoreKitDevices.set(originalTransactionId, set);
+    }
+    if (set.has(devHash)) return true;
+    if (set.size >= maxDevices) return false;
+    set.add(devHash);
+    return true;
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query(
+      `SELECT device_hash FROM storekit_transaction_devices
+       WHERE original_transaction_id = $1
+       FOR UPDATE`,
+      [originalTransactionId]
+    );
+    const known = existing.rows.map((r) => String(r.device_hash));
+    if (known.includes(devHash)) {
+      await client.query("COMMIT");
+      return true;
+    }
+    if (known.length >= maxDevices) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+    await client.query(
+      `INSERT INTO storekit_transaction_devices (original_transaction_id, device_hash)
+       VALUES ($1, $2)
+       ON CONFLICT (original_transaction_id, device_hash) DO NOTHING`,
+      [originalTransactionId, devHash]
+    );
+    await client.query("COMMIT");
+    return true;
+  } catch {
+    await client.query("ROLLBACK").catch(() => {});
+    return false;
+  } finally {
+    client.release();
+  }
+}
+
+export async function registerReferralCode(code: string, deviceId: string, hwKeyId?: string): Promise<void> {
   const cleanCode = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
   const ownerHash = hashDeviceId(deviceId);
+  const ownerHwHash = hwKeyId ? hashDeviceId(`hw:${hwKeyId}`) : undefined;
   if (cleanCode.length !== 6 || !ownerHash) return;
 
   if (!pool) {
-    if (!memoryReferrals.has(cleanCode)) {
-      memoryReferrals.set(cleanCode, { ownerHash, redeemers: new Set() });
+    const existing = memoryReferrals.get(cleanCode);
+    if (!existing) {
+      memoryReferrals.set(cleanCode, { ownerHash, ownerHwHash, redeemers: new Set() });
+    } else if (existing.ownerHash === ownerHash && !existing.ownerHwHash && ownerHwHash) {
+      existing.ownerHwHash = ownerHwHash;
     }
     return;
   }
 
   await pool.query(
-    `INSERT INTO referral_codes (code, owner_device_hash)
-     VALUES ($1, $2)
-     ON CONFLICT (code) DO NOTHING`,
-    [cleanCode, ownerHash]
+    `INSERT INTO referral_codes (code, owner_device_hash, owner_hw_hash)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (code) DO UPDATE SET
+       owner_hw_hash = COALESCE(referral_codes.owner_hw_hash, EXCLUDED.owner_hw_hash)
+     WHERE referral_codes.owner_device_hash = EXCLUDED.owner_device_hash`,
+    [cleanCode, ownerHash, ownerHwHash ?? null]
   );
 }
 
 export async function redeemReferralCode(
   code: string,
   deviceId: string,
-  hwKeyId?: string
+  hwKeyId: string
 ): Promise<{ accepted: boolean; status: number; message: string }> {
   const cleanCode = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
   const devHash = hashDeviceId(deviceId);
-  const hwHash = hwKeyId ? hashDeviceId(`hw:${hwKeyId}`) : undefined;
-  if (cleanCode.length !== 6 || !devHash) {
+  const hwHash = hashDeviceId(`hw:${hwKeyId}`);
+  if (cleanCode.length !== 6 || !devHash || !hwHash) {
     return { accepted: false, status: 400, message: "Enter a valid 6-character invite code." };
   }
+  const expiryMs = Date.now() + 62 * 86_400_000;
 
   if (!pool) {
     const ref = memoryReferrals.get(cleanCode);
     if (!ref) return { accepted: false, status: 404, message: "That invite code wasn't found. Ask your friend to open Bubstock once to activate their code." };
-    if (ref.ownerHash === devHash) return { accepted: false, status: 400, message: "That's your own code. Share it with a friend instead." };
-    if (memoryDeviceClaims.has(devHash) || (hwHash && memoryDeviceClaims.has(hwHash))) {
+    if (ref.ownerHash === devHash || (ref.ownerHwHash && ref.ownerHwHash === hwHash)) {
+      return { accepted: false, status: 400, message: "That's your own code. Share it with a friend instead." };
+    }
+    if (memoryDeviceClaims.has(devHash) || memoryDeviceClaims.has(hwHash)) {
       return { accepted: false, status: 409, message: "This device has already redeemed a free preview invite." };
     }
     ref.redeemers.add(devHash);
-    memoryDeviceClaims.add(devHash);
-    if (hwHash) memoryDeviceClaims.add(hwHash);
+    const base = Math.max(ref.lastRewardExpiresAtMs ?? Date.now(), Date.now());
+    ref.lastRewardExpiresAtMs = Math.min(base + 62 * 86_400_000, Date.now() + 366 * 86_400_000);
+    memoryDeviceClaims.set(devHash, expiryMs);
+    memoryDeviceClaims.set(hwHash, expiryMs);
     return { accepted: true, status: 200, message: "2 months of Bubstock+ Preview unlocked!" };
   }
 
-  const refRes = await pool.query(
-    `SELECT owner_device_hash, redeemer_hashes FROM referral_codes WHERE code = $1`,
-    [cleanCode]
-  );
-  if (refRes.rows.length === 0) {
-    return { accepted: false, status: 404, message: "That invite code wasn't found. Double-check the 6 characters with your friend." };
-  }
-  const ownerHash = String(refRes.rows[0].owner_device_hash);
-  if (ownerHash === devHash) {
-    return { accepted: false, status: 400, message: "That's your own invite code — share it with a friend instead." };
-  }
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const refRes = await client.query(
+      `SELECT owner_device_hash, owner_hw_hash, redeemer_hashes
+       FROM referral_codes
+       WHERE code = $1
+       FOR UPDATE`,
+      [cleanCode]
+    );
+    if (refRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return { accepted: false, status: 404, message: "That invite code wasn't found. Double-check the 6 characters with your friend." };
+    }
+    const ownerHash = String(refRes.rows[0].owner_device_hash);
+    const ownerHwHash = refRes.rows[0].owner_hw_hash ? String(refRes.rows[0].owner_hw_hash) : undefined;
+    if (ownerHash === devHash || (ownerHwHash && ownerHwHash === hwHash)) {
+      await client.query("ROLLBACK");
+      return { accepted: false, status: 400, message: "That's your own invite code — share it with a friend instead." };
+    }
 
-  // If attested with a hardware key, prevent rotating fake deviceId UUIDs from farming rewards
-  if (hwHash) {
-    const hwClaim = await pool.query(
-      `INSERT INTO device_promo_claims (device_hash, kind)
-       VALUES ($1, 'referral_hw')
+    const hwClaim = await client.query(
+      `INSERT INTO device_promo_claims (device_hash, kind, expires_at)
+       VALUES ($1, 'referral_hw', NOW() + INTERVAL '62 days')
        ON CONFLICT (device_hash) DO NOTHING
        RETURNING device_hash`,
       [hwHash]
     );
     if ((hwClaim.rowCount ?? 0) === 0) {
+      await client.query("ROLLBACK");
       return { accepted: false, status: 409, message: "This device has already claimed a free preview reward." };
     }
+
+    const claimRes = await client.query(
+      `INSERT INTO device_promo_claims (device_hash, kind, expires_at)
+       VALUES ($1, 'referral', NOW() + INTERVAL '62 days')
+       ON CONFLICT (device_hash) DO NOTHING
+       RETURNING device_hash`,
+      [devHash]
+    );
+    if ((claimRes.rowCount ?? 0) === 0) {
+      await client.query("ROLLBACK");
+      return { accepted: false, status: 409, message: "This device has already claimed a free preview reward." };
+    }
+
+    await client.query(
+      `UPDATE referral_codes
+       SET redeemer_hashes = CASE
+             WHEN $2 = ANY(redeemer_hashes) THEN redeemer_hashes
+             ELSE array_append(redeemer_hashes, $2)
+           END,
+           last_reward_expires_at = LEAST(
+             NOW() + INTERVAL '366 days',
+             GREATEST(COALESCE(last_reward_expires_at, NOW()), NOW()) + INTERVAL '62 days'
+           )
+       WHERE code = $1`,
+      [cleanCode, devHash]
+    );
+
+    await client.query("COMMIT");
+    return { accepted: true, status: 200, message: "2 months of Bubstock+ Preview unlocked! Welcome aboard." };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
-
-  const claimRes = await pool.query(
-    `INSERT INTO device_promo_claims (device_hash, kind)
-     VALUES ($1, 'referral')
-     ON CONFLICT (device_hash) DO NOTHING
-     RETURNING device_hash`,
-    [devHash]
-  );
-  if ((claimRes.rowCount ?? 0) === 0) {
-    return { accepted: false, status: 409, message: "This device has already claimed a free preview reward." };
-  }
-
-  await pool.query(
-    `UPDATE referral_codes
-     SET redeemer_hashes = CASE
-       WHEN $2 = ANY(redeemer_hashes) THEN redeemer_hashes
-       ELSE array_append(redeemer_hashes, $2)
-     END
-     WHERE code = $1`,
-    [cleanCode, devHash]
-  );
-
-  return { accepted: true, status: 200, message: "2 months of Bubstock+ Preview unlocked! Welcome aboard." };
 }
 
 export async function getReferralCodeOwnerStatus(
   code: string,
-  deviceId: string
+  deviceId: string,
+  hwKeyId?: string
 ): Promise<{ validOwner: boolean; redeemerCount: number }> {
   const cleanCode = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
   const ownerHash = hashDeviceId(deviceId);
+  const hwHash = hwKeyId ? hashDeviceId(`hw:${hwKeyId}`) : undefined;
   if (cleanCode.length !== 6 || !ownerHash) {
     return { validOwner: false, redeemerCount: 0 };
   }
@@ -1463,17 +1828,24 @@ export async function getReferralCodeOwnerStatus(
   if (!pool) {
     const ref = memoryReferrals.get(cleanCode);
     if (!ref || ref.ownerHash !== ownerHash) return { validOwner: false, redeemerCount: 0 };
+    if (ref.ownerHwHash && hwHash && ref.ownerHwHash !== hwHash) {
+      return { validOwner: false, redeemerCount: 0 };
+    }
     return { validOwner: true, redeemerCount: ref.redeemers.size };
   }
 
   try {
     const r = await pool.query(
-      `SELECT owner_device_hash, COALESCE(array_length(redeemer_hashes, 1), 0)::INT AS cnt
+      `SELECT owner_device_hash, owner_hw_hash, COALESCE(array_length(redeemer_hashes, 1), 0)::INT AS cnt
        FROM referral_codes WHERE code = $1`,
       [cleanCode]
     );
     if (r.rows.length === 0) return { validOwner: false, redeemerCount: 0 };
     if (String(r.rows[0].owner_device_hash) !== ownerHash) {
+      return { validOwner: false, redeemerCount: 0 };
+    }
+    const storedHw = r.rows[0].owner_hw_hash ? String(r.rows[0].owner_hw_hash) : undefined;
+    if (storedHw && hwHash && storedHw !== hwHash) {
       return { validOwner: false, redeemerCount: 0 };
     }
     return { validOwner: true, redeemerCount: Number(r.rows[0].cnt ?? 0) };
@@ -1482,28 +1854,47 @@ export async function getReferralCodeOwnerStatus(
   }
 }
 
-export async function hasDeviceVerifiedPromoOrReferral(deviceId: string): Promise<boolean> {
+export async function hasDeviceVerifiedPromoOrReferral(
+  deviceId: string,
+  hwKeyId?: string
+): Promise<boolean> {
   const devHash = hashDeviceId(deviceId);
   if (!devHash) return false;
+  if (hwKeyId) {
+    const bound = await bindAndVerifyDeviceKey(deviceId, hwKeyId);
+    if (!bound) return false;
+  }
+  const hwHash = hwKeyId ? hashDeviceId(`hw:${hwKeyId}`) : undefined;
+
   if (!pool) {
-    if (memoryDeviceClaims.has(devHash)) return true;
+    const now = Date.now();
+    const exp = memoryDeviceClaims.get(devHash);
+    if (exp && exp > now) return true;
+    if (hwHash) {
+      const hwExp = memoryDeviceClaims.get(hwHash);
+      if (hwExp && hwExp > now) return true;
+    }
     for (const ref of memoryReferrals.values()) {
-      if (ref.ownerHash === devHash && ref.redeemers.size > 0) return true;
+      const owns = ref.ownerHash === devHash || (Boolean(hwHash) && ref.ownerHwHash === hwHash);
+      if (owns && ref.redeemers.size > 0 && (ref.lastRewardExpiresAtMs ?? 0) > now) {
+        return true;
+      }
     }
     return false;
   }
   try {
+    const lookupHashes = hwHash ? [devHash, hwHash] : [devHash];
     const r = await pool.query(
       `SELECT 1 FROM device_promo_claims
-       WHERE device_hash = $1
-         AND claimed_at >= NOW() - INTERVAL '370 days'
+       WHERE device_hash = ANY($1::text[])
+         AND COALESCE(expires_at, claimed_at + INTERVAL '62 days') > NOW()
        UNION ALL
        SELECT 1 FROM referral_codes
-       WHERE owner_device_hash = $1
+       WHERE (owner_device_hash = $2 OR ($3::text IS NOT NULL AND owner_hw_hash = $3))
          AND COALESCE(array_length(redeemer_hashes, 1), 0) > 0
-         AND created_at >= NOW() - INTERVAL '370 days'
+         AND COALESCE(last_reward_expires_at, created_at + INTERVAL '62 days') > NOW()
        LIMIT 1`,
-      [devHash]
+      [lookupHashes, devHash, hwHash ?? null]
     );
     return (r.rowCount ?? 0) > 0;
   } catch {
@@ -1523,7 +1914,10 @@ export interface MothersGroupStatus {
   createdAt: string;
 }
 
-const memoryGroups = new Map<string, { suburb: string; city: string; members: Set<string>; ips: string[]; createdAt: string }>();
+const memoryGroups = new Map<
+  string,
+  { suburb: string; city: string; members: Set<string>; hwMembers: Set<string>; ips: string[]; createdAt: string }
+>();
 const GROUP_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789";
 
 function generateGroupCode(): string {
@@ -1543,9 +1937,11 @@ export async function createMothersGroup(
   suburb: string,
   city: string,
   deviceId: string,
-  clientIp?: string
+  clientIp?: string,
+  hwKeyId?: string
 ): Promise<MothersGroupStatus> {
   const hash = hashDeviceId(deviceId) ?? crypto.randomUUID().slice(0, 16);
+  const hwHash = hwKeyId ? hashDeviceId(`hw:${hwKeyId}`) : undefined;
   const ipHash = hashIp(clientIp);
   const createdAt = new Date().toISOString();
 
@@ -1558,18 +1954,25 @@ export async function createMothersGroup(
       const oldest = memoryGroups.keys().next().value;
       if (oldest) memoryGroups.delete(oldest);
     }
-    memoryGroups.set(code, { suburb, city, members: new Set([hash]), ips: [ipHash], createdAt });
+    memoryGroups.set(code, {
+      suburb,
+      city,
+      members: new Set([hash]),
+      hwMembers: new Set(hwHash ? [hwHash] : []),
+      ips: [ipHash],
+      createdAt,
+    });
     return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
   }
 
   for (let attempt = 0; attempt < 5; attempt++) {
     const code = generateGroupCode();
     const res = await pool.query(
-      `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes, member_ip_hashes)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes, member_ip_hashes, member_hw_hashes)
+       VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (group_code) DO NOTHING
        RETURNING group_code`,
-      [code, suburb, city, [hash], [ipHash]]
+      [code, suburb, city, [hash], [ipHash], hwHash ? [hwHash] : []]
     );
     if ((res.rowCount ?? 0) > 0) {
       return { groupCode: code, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
@@ -1577,10 +1980,10 @@ export async function createMothersGroup(
   }
   const fallbackCode = `MG${crypto.randomBytes(4).toString("hex").toUpperCase().slice(0, 6)}`;
   await pool.query(
-    `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes, member_ip_hashes)
-     VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO mothers_groups (group_code, suburb, city, member_hashes, member_ip_hashes, member_hw_hashes)
+     VALUES ($1, $2, $3, $4, $5, $6)
      ON CONFLICT (group_code) DO NOTHING`,
-    [fallbackCode, suburb, city, [hash], [ipHash]]
+    [fallbackCode, suburb, city, [hash], [ipHash], hwHash ? [hwHash] : []]
   );
   return { groupCode: fallbackCode, suburb, city, memberCount: 1, targetCount: 3, unlocked: false, createdAt };
 }
@@ -1588,24 +1991,35 @@ export async function createMothersGroup(
 export async function joinMothersGroup(
   groupCode: string,
   deviceId: string,
-  clientIp?: string
-): Promise<{ status: MothersGroupStatus | null; sybilBlocked?: boolean }> {
+  clientIp?: string,
+  hwKeyId?: string
+): Promise<{ status: MothersGroupStatus | null; sybilBlocked?: boolean; groupFull?: boolean }> {
   const cleanCode = groupCode.toUpperCase().replace(/[^A-Z0-9]/g, "");
   const hash = hashDeviceId(deviceId) ?? crypto.randomUUID().slice(0, 16);
+  const hwHash = hwKeyId ? hashDeviceId(`hw:${hwKeyId}`) : undefined;
   const ipHash = hashIp(clientIp);
+  const expiryMs = Date.now() + 62 * 86_400_000;
 
   if (!pool) {
     const g = memoryGroups.get(cleanCode);
     if (!g) return { status: null };
     if (!g.members.has(hash)) {
+      if (g.members.size >= 6) {
+        return { status: null, groupFull: true };
+      }
+      if (hwHash && g.hwMembers.has(hwHash)) {
+        return { status: null, sybilBlocked: true };
+      }
       const sameIpCount = g.ips.filter((x) => x === ipHash).length;
       if (sameIpCount >= 2) return { status: null, sybilBlocked: true };
       g.members.add(hash);
+      if (hwHash) g.hwMembers.add(hwHash);
       g.ips.push(ipHash);
     }
     const count = g.members.size;
     if (count >= 3) {
-      for (const m of g.members) memoryDeviceClaims.add(m);
+      for (const m of g.members) memoryDeviceClaims.set(m, expiryMs);
+      for (const hw of g.hwMembers) memoryDeviceClaims.set(hw, expiryMs);
     }
     return {
       status: {
@@ -1620,67 +2034,101 @@ export async function joinMothersGroup(
     };
   }
 
-  const existing = await pool.query(
-    `SELECT group_code, suburb, city, member_hashes, member_ip_hashes, created_at
-     FROM mothers_groups WHERE group_code = $1`,
-    [cleanCode]
-  );
-  if (existing.rows.length === 0) return { status: null };
-  const row = existing.rows[0];
-  const members: string[] = Array.isArray(row.member_hashes) ? row.member_hashes : [];
-  const ipHashes: string[] = Array.isArray(row.member_ip_hashes) ? row.member_ip_hashes : [];
-
-  if (!members.includes(hash)) {
-    const sameIpCount = ipHashes.filter((x) => x === ipHash).length;
-    // Allow max 2 members from the same Wi-Fi/IP so 3 fake joins from 1 device/network cannot self-unlock
-    if (sameIpCount >= 2) {
-      return { status: null, sybilBlocked: true };
-    }
-    const res = await pool.query(
-      `UPDATE mothers_groups
-       SET member_hashes = array_append(member_hashes, $2),
-           member_ip_hashes = array_append(member_ip_hashes, $3)
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const existing = await client.query(
+      `SELECT group_code, suburb, city, member_hashes, member_ip_hashes, member_hw_hashes, created_at
+       FROM mothers_groups
        WHERE group_code = $1
-       RETURNING group_code, suburb, city, member_hashes, created_at`,
-      [cleanCode, hash, ipHash]
+       FOR UPDATE`,
+      [cleanCode]
     );
-    const updated = res.rows[0];
-    const allMembers: string[] = Array.isArray(updated.member_hashes) ? updated.member_hashes : [hash];
-    const count = allMembers.length;
-    if (count >= 3) {
-      // Grant server-verified syndicate preview credit to ALL members in the group (mums 1, 2 & 3!)
-      await pool.query(
-        `INSERT INTO device_promo_claims (device_hash, kind)
-         SELECT DISTINCT unnest($1::text[]), 'syndicate'
-         ON CONFLICT (device_hash) DO NOTHING`,
-        [allMembers]
-      ).catch(() => {});
+    if (existing.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return { status: null };
     }
+    const row = existing.rows[0];
+    const members: string[] = Array.isArray(row.member_hashes) ? row.member_hashes : [];
+    const ipHashes: string[] = Array.isArray(row.member_ip_hashes) ? row.member_ip_hashes : [];
+    const hwHashes: string[] = Array.isArray(row.member_hw_hashes) ? row.member_hw_hashes : [];
+
+    if (!members.includes(hash)) {
+      if (members.length >= 6) {
+        await client.query("ROLLBACK");
+        return { status: null, groupFull: true };
+      }
+      if (hwHash && hwHashes.includes(hwHash)) {
+        await client.query("ROLLBACK");
+        return { status: null, sybilBlocked: true };
+      }
+      const sameIpCount = ipHashes.filter((x) => x === ipHash).length;
+      if (sameIpCount >= 2) {
+        await client.query("ROLLBACK");
+        return { status: null, sybilBlocked: true };
+      }
+      const res = await client.query(
+        `UPDATE mothers_groups
+         SET member_hashes = array_append(member_hashes, $2),
+             member_ip_hashes = array_append(member_ip_hashes, $3),
+             member_hw_hashes = CASE WHEN $4::text IS NULL THEN member_hw_hashes ELSE array_append(member_hw_hashes, $4) END
+         WHERE group_code = $1
+         RETURNING group_code, suburb, city, member_hashes, member_hw_hashes, created_at`,
+        [cleanCode, hash, ipHash, hwHash ?? null]
+      );
+      const updated = res.rows[0];
+      const allMembers: string[] = Array.isArray(updated.member_hashes) ? updated.member_hashes : [hash];
+      const allHwMembers: string[] = Array.isArray(updated.member_hw_hashes) ? updated.member_hw_hashes : [];
+      const count = allMembers.length;
+      if (count >= 3) {
+        await client.query(
+          `INSERT INTO device_promo_claims (device_hash, kind, expires_at)
+           SELECT DISTINCT unnest($1::text[]), 'syndicate', NOW() + INTERVAL '62 days'
+           ON CONFLICT (device_hash) DO NOTHING`,
+          [allMembers]
+        );
+        if (allHwMembers.length > 0) {
+          await client.query(
+            `INSERT INTO device_promo_claims (device_hash, kind, expires_at)
+             SELECT DISTINCT unnest($1::text[]), 'syndicate_hw', NOW() + INTERVAL '62 days'
+             ON CONFLICT (device_hash) DO NOTHING`,
+            [allHwMembers]
+          );
+        }
+      }
+      await client.query("COMMIT");
+      return {
+        status: {
+          groupCode: updated.group_code,
+          suburb: updated.suburb,
+          city: updated.city,
+          memberCount: count,
+          targetCount: 3,
+          unlocked: count >= 3,
+          createdAt: new Date(updated.created_at).toISOString(),
+        },
+      };
+    }
+
+    await client.query("COMMIT");
+    const count = members.length;
     return {
       status: {
-        groupCode: updated.group_code,
-        suburb: updated.suburb,
-        city: updated.city,
+        groupCode: row.group_code,
+        suburb: row.suburb,
+        city: row.city,
         memberCount: count,
         targetCount: 3,
         unlocked: count >= 3,
-        createdAt: new Date(updated.created_at).toISOString(),
+        createdAt: new Date(row.created_at).toISOString(),
       },
     };
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
-
-  const count = members.length;
-  return {
-    status: {
-      groupCode: row.group_code,
-      suburb: row.suburb,
-      city: row.city,
-      memberCount: count,
-      targetCount: 3,
-      unlocked: count >= 3,
-      createdAt: new Date(row.created_at).toISOString(),
-    },
-  };
 }
 
 export async function getMothersGroup(
@@ -1761,14 +2209,15 @@ export async function getSuburbShortages(hours = 24): Promise<SuburbShortageItem
          retailer,
          COUNT(*) FILTER (WHERE state = 'likelyGone')::INT AS out_cnt,
          COUNT(*) FILTER (WHERE state = 'runningLow')::INT AS low_cnt,
-         COUNT(DISTINCT COALESCE(device_hash, id))::INT AS reporters,
+         COUNT(DISTINCT COALESCE(hw_key_id, ip_hash, device_hash, id))::INT AS reporters,
+         COUNT(DISTINCT COALESCE(ip_hash, device_hash, id))::INT AS distinct_ips,
          MAX(reported_at) AS last_reported
        FROM shelf_sightings
        WHERE reported_at >= NOW() - ($1 || ' hours')::INTERVAL
          AND is_shadow_banned = FALSE
          AND state IN ('likelyGone', 'runningLow')
        GROUP BY product_id, suburb, retailer
-       ORDER BY out_cnt DESC, reporters DESC, last_reported DESC
+       ORDER BY reporters DESC, out_cnt DESC, last_reported DESC
        LIMIT 30`,
       [windowHrs]
     );
@@ -1781,7 +2230,8 @@ export async function getSuburbShortages(hours = 24): Promise<SuburbShortageItem
       outCount: Number(r.out_cnt),
       lowCount: Number(r.low_cnt),
       reporterCount: Number(r.reporters),
-      severity: Number(r.out_cnt) >= 2 ? "high" : "watch",
+      // Require >= 2 distinct real hardware/IP reporters to escalate to high severity (blocks single-IP Sybil spoofing)
+      severity: Number(r.out_cnt) >= 2 && Number(r.reporters) >= 2 && Number(r.distinct_ips) >= 2 ? "high" : "watch",
       lastReportedAt: new Date(r.last_reported).toISOString(),
     }));
   } catch (err) {
@@ -1962,7 +2412,18 @@ const memoryAttestedKeys = new Map<string, AttestedKeyRecord>();
 const memoryShadowBans = new Map<string, { strikes: number; isBanned: boolean; reason: string }>();
 
 export async function upsertAttestedKey(rec: AttestedKeyRecord): Promise<void> {
-  memoryAttestedKeys.set(rec.keyId, rec);
+  const prev = memoryAttestedKeys.get(rec.keyId);
+  if (prev && prev.publicKeyPem !== rec.publicKeyPem) {
+    return;
+  }
+  const merged: AttestedKeyRecord = {
+    ...rec,
+    attestMode: prev?.attestMode === "app_attest" ? "app_attest" : rec.attestMode,
+    appAttestCbor: prev?.appAttestCbor ?? rec.appAttestCbor,
+    lastCounter: Math.max(prev?.lastCounter ?? 0, rec.lastCounter),
+    taintMask: (prev?.taintMask ?? 0) | rec.taintMask,
+  };
+  memoryAttestedKeys.set(rec.keyId, merged);
   if (memoryAttestedKeys.size > 10_000) {
     const oldest = memoryAttestedKeys.keys().next().value;
     if (oldest) memoryAttestedKeys.delete(oldest);
@@ -1974,21 +2435,22 @@ export async function upsertAttestedKey(rec: AttestedKeyRecord): Promise<void> {
          (key_id, public_key_pem, attest_mode, app_attest_cbor, bundle_id, last_counter, taint_mask, enrolled_ip_hash, enrolled_at, last_seen_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())
        ON CONFLICT (key_id) DO UPDATE SET
-         public_key_pem = EXCLUDED.public_key_pem,
-         attest_mode = EXCLUDED.attest_mode,
-         app_attest_cbor = COALESCE(EXCLUDED.app_attest_cbor, attested_keys.app_attest_cbor),
+         attest_mode = CASE WHEN attested_keys.attest_mode = 'app_attest' THEN 'app_attest' ELSE EXCLUDED.attest_mode END,
+         app_attest_cbor = COALESCE(attested_keys.app_attest_cbor, EXCLUDED.app_attest_cbor),
          bundle_id = EXCLUDED.bundle_id,
-         taint_mask = GREATEST(attested_keys.taint_mask, EXCLUDED.taint_mask),
-         last_seen_at = NOW()`,
+         last_counter = GREATEST(attested_keys.last_counter, EXCLUDED.last_counter),
+         taint_mask = (attested_keys.taint_mask | EXCLUDED.taint_mask),
+         last_seen_at = NOW()
+       WHERE attested_keys.public_key_pem = EXCLUDED.public_key_pem`,
       [
-        rec.keyId,
-        rec.publicKeyPem,
-        rec.attestMode,
-        rec.appAttestCbor ?? null,
-        rec.bundleId,
-        rec.lastCounter,
-        rec.taintMask,
-        rec.enrolledIpHash ?? null,
+        merged.keyId,
+        merged.publicKeyPem,
+        merged.attestMode,
+        merged.appAttestCbor ?? null,
+        merged.bundleId,
+        merged.lastCounter,
+        merged.taintMask,
+        merged.enrolledIpHash ?? null,
       ]
     );
   } catch (err) {
@@ -2179,28 +2641,412 @@ export async function recordDeviceStrike(
   }
 }
 
-export async function countRecentLikelyGoneByDevice(deviceId?: string, minutes = 10): Promise<number> {
+export async function countRecentLikelyGoneByDevice(
+  deviceId?: string,
+  minutes = 10,
+  ipHash?: string,
+  hwKeyId?: string
+): Promise<number> {
   const hash = hashDeviceId(deviceId);
-  if (!hash) return 0;
+  if (!hash && !ipHash && !hwKeyId) return 0;
   if (!pool) {
     const cutoff = Date.now() - minutes * 60_000;
-    return memorySightingsWithHash.filter(
-      (s) => s.deviceHash === hash && s.state === "likelyGone" && new Date(s.reportedAt).getTime() >= cutoff
-    ).length;
+    const stores = new Set(
+      memorySightingsWithHash
+        .filter(
+          (s) =>
+            s.state === "likelyGone" &&
+            new Date(s.reportedAt).getTime() >= cutoff &&
+            ((hash && s.deviceHash === hash) ||
+              (ipHash && s.ipHash === ipHash) ||
+              (hwKeyId && s.hwKeyId === hwKeyId))
+        )
+        .map((s) => s.storeId)
+    );
+    return stores.size;
   }
   try {
     const res = await pool.query(
       `SELECT COUNT(DISTINCT store_id)::INT AS cnt
        FROM shelf_sightings
-       WHERE device_hash = $1
-         AND state = 'likelyGone'
-         AND reported_at >= NOW() - ($2 || ' minutes')::INTERVAL`,
-      [hash, minutes]
+       WHERE state = 'likelyGone'
+         AND reported_at >= NOW() - ($4 || ' minutes')::INTERVAL
+         AND (
+           ($1::TEXT IS NOT NULL AND device_hash = $1)
+           OR ($2::TEXT IS NOT NULL AND ip_hash = $2)
+           OR ($3::TEXT IS NOT NULL AND hw_key_id = $3)
+         )`,
+      [hash ?? null, ipHash ?? null, hwKeyId ?? null, minutes]
     );
     return Number(res.rows[0]?.cnt ?? 0);
   } catch {
     return 0;
   }
+}
+
+// ─── Batch 90-Day Medians for Cambridge Real Discount / Fake Special Score ──
+
+export async function getRecentProductMediansMap(): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (!pool) return out;
+  try {
+    const res = await pool.query(
+      `SELECT lower(COALESCE(matched_name, product_name)) AS key_name,
+              PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price)::NUMERIC(8,2) AS median_price,
+              COUNT(*)::INT AS samples
+       FROM price_entries
+       WHERE fetched_at >= NOW() - INTERVAL '90 days'
+         AND price >= 1.0 AND price <= 350.0
+       GROUP BY lower(COALESCE(matched_name, product_name))
+       HAVING COUNT(*) >= 3
+       LIMIT 2500`
+    );
+    for (const r of res.rows) {
+      const k = String(r.key_name ?? "").trim();
+      const v = Number(r.median_price);
+      if (k && Number.isFinite(v) && v > 0) out.set(k, v);
+    }
+  } catch {
+    // non-fatal
+  }
+  return out;
+}
+
+// ─── Zero-Install Grandparent / Babysitter Live Safe-Shop Links (72h TTL) ───
+
+export interface SafeShopLinkRecord {
+  token: string;
+  suburb: string;
+  state: string;
+  stageLabel: string;
+  avoidedAllergens: string[];
+  items: Array<{ name: string; retailer?: string; priceText?: string; note?: string }>;
+  recallClear: boolean;
+  expiresAt: string;
+  createdAt: string;
+}
+
+const MAX_SAFESHOP_LINKS_PER_KEY_DAY = 10;
+const MAX_SAFESHOP_TOTAL_ROWS = 25_000;
+const memorySafeShopLinks = new Map<string, SafeShopLinkRecord & { ownerKeyId: string }>();
+
+export async function createSafeShopLink(input: {
+  ownerKeyId: string;
+  suburb: string;
+  state: string;
+  stageLabel: string;
+  avoidedAllergens: string[];
+  items: Array<{ name: string; retailer?: string; priceText?: string; note?: string }>;
+  recallClear: boolean;
+  ttlHours?: number;
+}): Promise<{ link?: SafeShopLinkRecord; quotaExceeded?: boolean; storageFull?: boolean }> {
+  const token = crypto.randomBytes(9).toString("base64url");
+  const ttlHrs = Math.min(Math.max(input.ttlHours ?? 72, 6), 168);
+  const now = new Date();
+  const expires = new Date(now.getTime() + ttlHrs * 3600 * 1000);
+  const rec: SafeShopLinkRecord = {
+    token,
+    suburb: input.suburb,
+    state: input.state,
+    stageLabel: input.stageLabel,
+    avoidedAllergens: input.avoidedAllergens,
+    items: input.items,
+    recallClear: input.recallClear,
+    expiresAt: expires.toISOString(),
+    createdAt: now.toISOString(),
+  };
+
+  if (!pool) {
+    const nowMs = Date.now();
+    const dayAgo = nowMs - 24 * 3600 * 1000;
+    let keyDailyCount = 0;
+    for (const [k, v] of memorySafeShopLinks) {
+      if (new Date(v.expiresAt).getTime() <= nowMs) {
+        memorySafeShopLinks.delete(k);
+        continue;
+      }
+      if (v.ownerKeyId === input.ownerKeyId && new Date(v.createdAt).getTime() >= dayAgo) {
+        keyDailyCount++;
+      }
+    }
+    if (keyDailyCount >= MAX_SAFESHOP_LINKS_PER_KEY_DAY) {
+      return { quotaExceeded: true };
+    }
+    if (memorySafeShopLinks.size >= 1500) {
+      const oldest = memorySafeShopLinks.keys().next().value;
+      if (oldest) memorySafeShopLinks.delete(oldest);
+    }
+    memorySafeShopLinks.set(token, { ...rec, ownerKeyId: input.ownerKeyId });
+    return { link: rec };
+  }
+
+  const keyDaily = await pool.query(
+    `SELECT COUNT(*)::INT AS cnt FROM safeshop_links
+     WHERE owner_key_id = $1 AND created_at >= NOW() - INTERVAL '24 hours'`,
+    [input.ownerKeyId]
+  );
+  if (Number(keyDaily.rows[0]?.cnt ?? 0) >= MAX_SAFESHOP_LINKS_PER_KEY_DAY) {
+    return { quotaExceeded: true };
+  }
+
+  await pool.query(`DELETE FROM safeshop_links WHERE expires_at < NOW()`).catch(() => {});
+  const totalRes = await pool.query(`SELECT COUNT(*)::INT AS cnt FROM safeshop_links`);
+  if (Number(totalRes.rows[0]?.cnt ?? 0) >= MAX_SAFESHOP_TOTAL_ROWS) {
+    return { storageFull: true };
+  }
+
+  await pool.query(
+    `INSERT INTO safeshop_links
+       (token, owner_key_id, suburb, state, stage_label, avoided_allergens, items_json, recall_clear, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)`,
+    [
+      token,
+      input.ownerKeyId,
+      input.suburb,
+      input.state,
+      input.stageLabel,
+      input.avoidedAllergens,
+      JSON.stringify(input.items),
+      input.recallClear,
+      expires.toISOString(),
+    ]
+  );
+  return { link: rec };
+}
+
+export async function getSafeShopLink(token: string): Promise<SafeShopLinkRecord | null> {
+  if (!pool) {
+    const rec = memorySafeShopLinks.get(token);
+    if (!rec) return null;
+    if (new Date(rec.expiresAt).getTime() <= Date.now()) {
+      memorySafeShopLinks.delete(token);
+      return null;
+    }
+    return rec;
+  }
+  const r = await pool.query(
+    `SELECT token, suburb, state, stage_label, avoided_allergens, items_json, recall_clear, expires_at, created_at
+     FROM safeshop_links
+     WHERE token = $1 AND expires_at > NOW()`,
+    [token]
+  );
+  if (r.rows.length === 0) return null;
+  const row = r.rows[0];
+  return {
+    token: String(row.token),
+    suburb: String(row.suburb),
+    state: String(row.state),
+    stageLabel: String(row.stage_label),
+    avoidedAllergens: Array.isArray(row.avoided_allergens) ? row.avoided_allergens.map(String) : [],
+    items: Array.isArray(row.items_json) ? row.items_json : [],
+    recallClear: Boolean(row.recall_clear),
+    expiresAt: new Date(row.expires_at).toISOString(),
+    createdAt: new Date(row.created_at).toISOString(),
+  };
+}
+
+// ─── Formula Emergency Relay (Privacy-Safe Local Stock Ping, 6h TTL) ────────
+
+export interface FormulaRelayReply {
+  id: string;
+  storeName: string;
+  suburb: string;
+  note?: string;
+  createdAt: string;
+}
+
+export interface FormulaRelayItem {
+  id: string;
+  productId: string;
+  productName: string;
+  suburb: string;
+  auState: string;
+  latCoarse: number;
+  lonCoarse: number;
+  note?: string;
+  status: string;
+  replies: FormulaRelayReply[];
+  expiresAt: string;
+  createdAt: string;
+}
+
+const memoryRelays = new Map<string, FormulaRelayItem & { ownerKeyId: string }>();
+
+export async function createFormulaRelay(input: {
+  ownerKeyId: string;
+  productId: string;
+  productName: string;
+  suburb: string;
+  auState: string;
+  latCoarse: number;
+  lonCoarse: number;
+  note?: string;
+}): Promise<{ relay?: FormulaRelayItem; dailyLimitReached?: boolean }> {
+  const id = crypto.randomUUID();
+  const now = new Date();
+  const expires = new Date(now.getTime() + 6 * 3600 * 1000);
+  const relay: FormulaRelayItem = {
+    id,
+    productId: input.productId,
+    productName: input.productName,
+    suburb: input.suburb,
+    auState: input.auState,
+    latCoarse: input.latCoarse,
+    lonCoarse: input.lonCoarse,
+    note: input.note,
+    status: "open",
+    replies: [],
+    expiresAt: expires.toISOString(),
+    createdAt: now.toISOString(),
+  };
+
+  if (!pool) {
+    const nowMs = Date.now();
+    const dayAgo = nowMs - 24 * 3600 * 1000;
+    let count = 0;
+    for (const [k, r] of memoryRelays) {
+      if (new Date(r.expiresAt).getTime() <= nowMs) {
+        memoryRelays.delete(k);
+        continue;
+      }
+      if (r.ownerKeyId === input.ownerKeyId && new Date(r.createdAt).getTime() >= dayAgo) count++;
+    }
+    if (count >= 3) return { dailyLimitReached: true };
+    if (memoryRelays.size >= 500) {
+      const oldest = memoryRelays.keys().next().value;
+      if (oldest) memoryRelays.delete(oldest);
+    }
+    memoryRelays.set(id, { ...relay, ownerKeyId: input.ownerKeyId });
+    return { relay };
+  }
+
+  const daily = await pool.query(
+    `SELECT COUNT(*)::INT AS cnt FROM formula_relays
+     WHERE owner_key_id = $1 AND created_at >= NOW() - INTERVAL '24 hours'`,
+    [input.ownerKeyId]
+  );
+  if (Number(daily.rows[0]?.cnt ?? 0) >= 3) {
+    return { dailyLimitReached: true };
+  }
+
+  await pool.query(
+    `INSERT INTO formula_relays
+       (id, owner_key_id, product_id, product_name, suburb, au_state, lat_coarse, lon_coarse, note, status, expires_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'open',$10)`,
+    [
+      id,
+      input.ownerKeyId,
+      input.productId,
+      input.productName,
+      input.suburb,
+      input.auState,
+      input.latCoarse,
+      input.lonCoarse,
+      input.note ?? null,
+      expires.toISOString(),
+    ]
+  );
+  return { relay };
+}
+
+export async function listNearbyFormulaRelays(lat: number, lon: number, auState?: string): Promise<FormulaRelayItem[]> {
+  const latDelta = 0.25; // ~27 km coarse filter
+  const lonDelta = 0.30;
+  if (!pool) {
+    const nowMs = Date.now();
+    return [...memoryRelays.values()]
+      .filter(
+        (r) =>
+          new Date(r.expiresAt).getTime() > nowMs &&
+          Math.abs(r.latCoarse - lat) <= latDelta &&
+          Math.abs(r.lonCoarse - lon) <= lonDelta
+      )
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .slice(0, 12)
+      .map(({ ownerKeyId: _omit, ...rest }) => rest);
+  }
+  const r = await pool.query(
+    `SELECT id, product_id, product_name, suburb, au_state, lat_coarse, lon_coarse, note, status, expires_at, created_at
+     FROM formula_relays
+     WHERE expires_at > NOW()
+       AND (
+         (lat_coarse BETWEEN $1 AND $2 AND lon_coarse BETWEEN $3 AND $4)
+         OR ($5::TEXT IS NOT NULL AND au_state = $5)
+       )
+     ORDER BY created_at DESC
+     LIMIT 12`,
+    [lat - latDelta, lat + latDelta, lon - lonDelta, lon + lonDelta, auState ?? null]
+  );
+  if (r.rows.length === 0) return [];
+  const ids = r.rows.map((row) => String(row.id));
+  const repliesRes = await pool.query(
+    `SELECT id, relay_id, store_name, suburb, note, created_at
+     FROM formula_relay_replies
+     WHERE relay_id = ANY($1::text[])
+     ORDER BY created_at DESC`,
+    [ids]
+  );
+  const byRelay = new Map<string, FormulaRelayReply[]>();
+  for (const rep of repliesRes.rows) {
+    const rid = String(rep.relay_id);
+    const list = byRelay.get(rid) ?? [];
+    list.push({
+      id: String(rep.id),
+      storeName: String(rep.store_name),
+      suburb: String(rep.suburb),
+      note: rep.note ? String(rep.note) : undefined,
+      createdAt: new Date(rep.created_at).toISOString(),
+    });
+    byRelay.set(rid, list);
+  }
+  return r.rows.map((row) => ({
+    id: String(row.id),
+    productId: String(row.product_id),
+    productName: String(row.product_name),
+    suburb: String(row.suburb),
+    auState: String(row.au_state),
+    latCoarse: Number(row.lat_coarse),
+    lonCoarse: Number(row.lon_coarse),
+    note: row.note ? String(row.note) : undefined,
+    status: String(row.status),
+    replies: byRelay.get(String(row.id)) ?? [],
+    expiresAt: new Date(row.expires_at).toISOString(),
+    createdAt: new Date(row.created_at).toISOString(),
+  }));
+}
+
+export async function replyFormulaRelay(input: {
+  relayId: string;
+  helperKeyId: string;
+  storeName: string;
+  suburb: string;
+  note?: string;
+}): Promise<{ ok: boolean; reply?: FormulaRelayReply }> {
+  const id = crypto.randomUUID();
+  const createdAt = new Date().toISOString();
+  const reply: FormulaRelayReply = {
+    id,
+    storeName: input.storeName,
+    suburb: input.suburb,
+    note: input.note,
+    createdAt,
+  };
+  if (!pool) {
+    const existing = memoryRelays.get(input.relayId);
+    if (!existing || new Date(existing.expiresAt).getTime() <= Date.now()) return { ok: false };
+    existing.replies.unshift(reply);
+    existing.status = "spotted";
+    return { ok: true, reply };
+  }
+  const check = await pool.query(`SELECT id FROM formula_relays WHERE id = $1 AND expires_at > NOW()`, [input.relayId]);
+  if (check.rows.length === 0) return { ok: false };
+  await pool.query(
+    `INSERT INTO formula_relay_replies (id, relay_id, helper_key_id, store_name, suburb, note)
+     VALUES ($1,$2,$3,$4,$5,$6)`,
+    [id, input.relayId, input.helperKeyId, input.storeName, input.suburb, input.note ?? null]
+  );
+  await pool.query(`UPDATE formula_relays SET status = 'spotted' WHERE id = $1`, [input.relayId]);
+  return { ok: true, reply };
 }
 
 export async function getSecurityTelemetrySummary(): Promise<{
@@ -2293,6 +3139,9 @@ export async function pruneStaleRecords(): Promise<void> {
       pool.query(`DELETE FROM price_entries WHERE fetched_at < NOW() - INTERVAL '370 days'`),
       pool.query(`DELETE FROM hostile_fingerprints WHERE expires_at < NOW()`),
       pool.query(`DELETE FROM honeypot_hits WHERE created_at < NOW() - INTERVAL '30 days'`),
+      pool.query(`DELETE FROM shelf_sightings WHERE reported_at < NOW() - INTERVAL '30 days'`),
+      pool.query(`DELETE FROM safeshop_links WHERE expires_at < NOW()`),
+      pool.query(`DELETE FROM formula_relays WHERE expires_at < NOW() - INTERVAL '24 hours'`),
     ]);
   } catch (err) {
     console.error("[db] pruneStaleRecords error:", (err as Error).message);

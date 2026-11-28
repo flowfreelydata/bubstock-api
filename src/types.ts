@@ -1,6 +1,6 @@
 export type AuCity = "melbourne" | "sydney" | "brisbane" | "perth" | "adelaide" | "tasmania";
 export type AuStateUpper = "VIC" | "NSW" | "QLD" | "WA" | "SA" | "TAS";
-export type AuStateLower = "vic" | "nsw" | "qld" | "wa" | "sa" | "tas";
+export type AuStateLower = "vic" | "nsw" | "qld" | "wa" | "sa" | "tas" | "act" | "nt";
 
 export type FeedStatusKind = "live" | "no_match" | "unavailable";
 
@@ -67,6 +67,9 @@ export interface SpecialEntry {
   productUrl?: string;
   saleEndsAt?: string;
   lastUpdated: string;
+  verifiedMedianPrice?: number;
+  realDiscountPercent?: number;
+  isInflatedSpecial?: boolean;
 }
 
 export interface RecallEntry {

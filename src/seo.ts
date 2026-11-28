@@ -292,11 +292,155 @@ export const SEO_FLAGSHIP_SLUGS = [
   "farex-baby-rice-cereal",
 ];
 
+export interface SafeShopLinkPayload {
+  token: string;
+  suburb: string;
+  state: string;
+  stageLabel: string;
+  avoidedAllergens: string[];
+  items: Array<{
+    name: string;
+    retailer?: string;
+    priceText?: string;
+    note?: string;
+  }>;
+  recallClear: boolean;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export function renderSafeShopWebPage(link: SafeShopLinkPayload): string {
+  const allergenBanner =
+    link.avoidedAllergens.length > 0
+      ? `<div class="card" style="background:#fff1f1;border-color:#e5484d;">
+           <div style="font-size:12px;font-weight:800;letter-spacing:.6px;color:#b42318;">🛑 STRICTLY AVOID ALLERGENS</div>
+           <div style="font-size:20px;font-weight:800;color:#b42318;margin-top:4px;">${escapeHtml(link.avoidedAllergens.map((a) => a.toUpperCase()).join("  •  "))}</div>
+           <div style="font-size:13px;color:#7a271a;margin-top:4px;">Always check the physical label before buying.</div>
+         </div>`
+      : `<div class="card" style="background:#eef9f4;border-color:#118357;">
+           <strong style="color:#118357;">✅ No allergens listed</strong> — still check the back of the pack for any recipe changes.
+         </div>`;
+
+  const itemsHtml = link.items
+    .map(
+      (it, idx) => `
+      <div class="card" style="padding:18px;">
+        <div class="row">
+          <div>
+            <div style="font-size:12px;font-weight:800;color:#0d7a6c;">ITEM ${idx + 1}</div>
+            <div style="font-size:18px;font-weight:700;margin-top:2px;">${escapeHtml(it.name)}</div>
+            ${it.note ? `<div style="font-size:13px;color:#566865;margin-top:4px;">${escapeHtml(it.note)}</div>` : ""}
+          </div>
+          ${
+            it.priceText || it.retailer
+              ? `<div style="text-align:right;">
+                   ${it.priceText ? `<div class="price">${escapeHtml(it.priceText)}</div>` : ""}
+                   ${it.retailer ? `<div style="font-size:13px;font-weight:700;color:#0d7a6c;">${escapeHtml(it.retailer)}</div>` : ""}
+                 </div>`
+              : ""
+          }
+        </div>
+      </div>`
+    )
+    .join("");
+
+  return layout({
+    title: `Safe-Shop Baby List (${link.suburb}) | Bubstock`,
+    description: `Zero-install safe shopping list with allergen checks and live Australian prices.`,
+    canonicalPath: `/s/${encodeURIComponent(link.token)}`,
+    jsonLd: { "@context": "https://schema.org", "@type": "WebPage", name: "Bubstock Caregiver Safe-Shop List" },
+    bodyHtml: `
+      <div class="hero">
+        <span class="pill">Zero-Install Caregiver Safe-Shop · ${escapeHtml(link.suburb)} ${escapeHtml(link.state)}</span>
+        <h1>Approved Baby Shopping List</h1>
+        <p>${escapeHtml(link.stageLabel)} · ${link.recallClear ? "Checked clear against live FSANZ &amp; ACCC recalls" : "Check active recall warnings in Bubstock"} · Auto-expires ${escapeHtml(link.expiresAt.slice(0, 10))}.</p>
+      </div>
+      ${allergenBanner}
+      <h2 style="font-size:18px;margin:18px 0 10px;">Buy ONLY these exact items (${link.items.length})</h2>
+      ${itemsHtml}
+      <div class="card" style="font-size:13px;color:#566865;">
+        <strong>Privacy Note:</strong> This expiring link contains no child names, home addresses, or phone numbers.
+      </div>
+    `,
+  });
+}
+
+export function renderMonthlyPressReportPage(
+  index: BabyCostIndexData,
+  topGaps: PriceGapItem[],
+  recalls: RecallEntry[],
+  monthLabel: string
+): string {
+  const top5Gaps = topGaps
+    .slice(0, 10)
+    .map(
+      (g, i) => `
+      <tr>
+        <td style="padding:8px;border-bottom:1px solid #e3ecea;">${i + 1}. <strong>${escapeHtml(g.displayName)}</strong></td>
+        <td style="padding:8px;border-bottom:1px solid #e3ecea;">$${g.woolworths.price.toFixed(2)}</td>
+        <td style="padding:8px;border-bottom:1px solid #e3ecea;">$${g.coles.price.toFixed(2)}</td>
+        <td style="padding:8px;border-bottom:1px solid #e3ecea;color:#118357;font-weight:700;">${escapeHtml(g.cheaperRetailer)} (-$${g.savingsAmount.toFixed(2)})</td>
+      </tr>`
+    )
+    .join("");
+
+  return layout({
+    title: `Australian Baby Cost-of-Living Monthly Press Report — ${monthLabel} | Bubstock`,
+    description: `Verified Australian infant formula, nappy & baby food price index, Coles vs Woolworths gaps, shrinkflation count and FSANZ/ACCC recall summary for ${monthLabel}.`,
+    canonicalPath: "/au/report",
+    jsonLd: {
+      "@context": "https://schema.org",
+      "@type": "Report",
+      name: `Bubstock Australian Baby Cost-of-Living Report — ${monthLabel}`,
+      datePublished: index.generatedAt,
+    },
+    bodyHtml: `
+      <div class="hero">
+        <span class="pill">Monthly Public Interest Brief · ${escapeHtml(monthLabel)}</span>
+        <h1>Australian Baby Cost-of-Living Report</h1>
+        <p>100% live Australian supermarket data (VIC, NSW, ACT, QLD, WA, SA, TAS, NT) · Zero synthetic estimates · Free for journalists &amp; policy researchers to cite with attribution.</p>
+      </div>
+      <div class="grid">
+        <div class="stat"><strong>${index.medianFormulaPriceAUD ? "$" + index.medianFormulaPriceAUD.toFixed(2) : "—"}</strong><span>Verified Median Formula</span></div>
+        <div class="stat"><strong>${index.medianNappiesPriceAUD ? "$" + index.medianNappiesPriceAUD.toFixed(2) : "—"}</strong><span>Verified Median Nappies</span></div>
+        <div class="stat"><strong>$${index.averageColesVsWooliesGapAUD.toFixed(2)}</strong><span>Avg Coles vs Woolies Gap</span></div>
+        <div class="stat"><strong>$${index.biggestGapAUD.toFixed(2)}</strong><span>Largest Single-Item Gap</span></div>
+        <div class="stat"><strong>${index.shrinkflationAlertsCount}</strong><span>90-Day Shrinkflation Flags</span></div>
+        <div class="stat"><strong>${index.activeRecallsCount}</strong><span>Active FSANZ / ACCC Recalls</span></div>
+      </div>
+      <div class="card">
+        <h2 style="font-size:17px;margin:0 0 10px;">Top Verified Coles vs Woolworths Price Gaps</h2>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr style="text-align:left;color:#566865;">
+              <th style="padding:8px;border-bottom:2px solid #e3ecea;">Product</th>
+              <th style="padding:8px;border-bottom:2px solid #e3ecea;">Woolworths</th>
+              <th style="padding:8px;border-bottom:2px solid #e3ecea;">Coles</th>
+              <th style="padding:8px;border-bottom:2px solid #e3ecea;">Cheaper</th>
+            </tr>
+          </thead>
+          <tbody>${top5Gaps || `<tr><td colspan="4" style="padding:10px;">Live price pairs syncing.</td></tr>`}</tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2 style="font-size:17px;margin:0 0 8px;">Latest Official FSANZ &amp; ACCC Notices (${recalls.length} active)</h2>
+        ${recalls
+          .slice(0, 6)
+          .map(
+            (r) => `<div style="padding:6px 0;border-bottom:1px solid #e3ecea;"><strong>${escapeHtml(r.agency)}</strong> · ${escapeHtml(r.productName)} <span style="color:#566865;font-size:12px;">(${escapeHtml(r.recallDate || "Active")})</span></div>`
+          )
+          .join("")}
+      </div>
+    `,
+  });
+}
+
 export function renderSitemapXml(cities: string[]): string {
   const base = "https://bubstock-api-production.up.railway.app";
   const urls: string[] = [
     `${base}/au/half-price-baby-deals`,
     `${base}/au/index`,
+    `${base}/au/report`,
   ];
   for (const city of cities) {
     for (const slug of SEO_FLAGSHIP_SLUGS) {

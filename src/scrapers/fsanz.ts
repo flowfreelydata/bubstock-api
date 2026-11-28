@@ -12,38 +12,72 @@ const ACCC_BASE = "https://www.productsafety.gov.au";
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
 
-const ALLERGEN_KEYWORDS: [string, string][] = [
-  ["dairy", "dairy"],
-  ["milk", "dairy"],
-  ["soy", "soy"],
-  ["soya", "soy"],
-  ["gluten", "gluten"],
-  ["wheat", "gluten"],
-  ["egg", "egg"],
-  ["peanut", "peanut"],
-  ["tree nut", "treeNut"],
-  ["almond", "treeNut"],
-  ["cashew", "treeNut"],
-  ["walnut", "treeNut"],
-  ["hazelnut", "treeNut"],
-  ["pistachio", "treeNut"],
-  ["macadamia", "treeNut"],
-  ["fish", "fish"],
-  ["crustacea", "shellfish"],
-  ["shellfish", "shellfish"],
-  ["sesame", "sesame"],
-  ["lupin", "lupin"],
-  ["sulphite", "sulphite"],
+const ALLERGEN_NEGATION_PATTERNS: RegExp[] = [
+  /\b(?:gluten|wheat|dairy|milk|lactose|soy|soya|egg|peanuts?|tree\s*nuts?|nuts?|sesame|fish|shellfish|crustacea\w*|lupins?|sulphites?|sulfites?)[\s-]+free\b/gi,
+  /\bfree\s+from\s+(?:gluten|wheat|dairy|milk|lactose|soy|soya|egg|peanuts?|tree\s*nuts?|nuts?|sesame|fish|shellfish|crustacea\w*|lupins?|sulphites?|sulfites?)\b/gi,
+  /\bno\s+added\s+(?:dairy|milk|lactose|gluten|wheat|soy)\b/gi,
+  /\b(?:coconut\s+milk|buckwheat|eggplant|butternut|nutmeg)\b/gi,
+];
+
+const ALLERGEN_PATTERNS: Array<[RegExp, string]> = [
+  [/\b(?:dairy|milk|whey|casein|lactose)\b/i, "dairy"],
+  [/\b(?:soy|soya|soybean)\b/i, "soy"],
+  [/\b(?:gluten|wheat|barley|rye|oats?)\b/i, "gluten"],
+  [/\beggs?\b/i, "egg"],
+  [/\bpeanuts?\b/i, "peanut"],
+  [/\b(?:tree\s+nuts?|almonds?|cashews?|walnuts?|hazelnuts?|pistachios?|macadamias?|pecans?)\b/i, "treeNut"],
+  [/\bfish\b/i, "fish"],
+  [/\b(?:crustacea\w*|shellfish|prawns?|shrimp)\b/i, "shellfish"],
+  [/\bsesame\b/i, "sesame"],
+  [/\blupins?\b/i, "lupin"],
+  [/\b(?:sulphites?|sulfites?)\b/i, "sulphite"],
 ];
 
 const CANONICAL_STATE_ORDER = ["National", "NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT", "Online"] as const;
 
 function extractAllergens(text: string): string[] {
-  const lower = text.toLowerCase();
-  const found = new Set<string>();
-  for (const [keyword, allergenId] of ALLERGEN_KEYWORDS) {
-    if (lower.includes(keyword)) found.add(allergenId);
+  let sanitized = text.toLowerCase();
+  for (const neg of ALLERGEN_NEGATION_PATTERNS) {
+    sanitized = sanitized.replace(neg, " ");
   }
+  const found = new Set<string>();
+  for (const [pattern, allergenId] of ALLERGEN_PATTERNS) {
+    if (pattern.test(sanitized)) found.add(allergenId);
+  }
+  return [...found];
+}
+
+function isPlausibleBarcode(digits: string): boolean {
+  if (!/^(?:\d{8}|\d{12}|\d{13}|\d{14})$/.test(digits)) return false;
+  if (/^0+$/.test(digits)) return false;
+  if (/^(?:1300|1800|04\d{2}|20[12]\d(?:0[1-9]|1[0-2]))/.test(digits)) return false;
+  return true;
+}
+
+function extractBarcodesFromText(text: string): string[] {
+  const found = new Set<string>();
+
+  // 1. Labeled APN / EAN / GTIN / Barcode values (may include spaces or dashes)
+  const labeledRe = /\b(?:apn|ean|gtin|barcode|bar\s*code)\s*[:#-]?\s*([0-9][0-9\s-]{7,18}[0-9])\b/gi;
+  let m: RegExpExecArray | null;
+  while ((m = labeledRe.exec(text)) !== null) {
+    const digits = m[1].replace(/\D/g, "");
+    if (isPlausibleBarcode(digits)) {
+      found.add(digits);
+      if (found.size >= 20) return [...found];
+    }
+  }
+
+  // 2. Standalone 12–14 digit EAN/UPC/GTIN sequences (e.g. AU 93... EAN-13)
+  const rawRe = /\b(\d{12,14})\b/g;
+  while ((m = rawRe.exec(text)) !== null) {
+    const digits = m[1];
+    if (isPlausibleBarcode(digits)) {
+      found.add(digits);
+      if (found.size >= 20) return [...found];
+    }
+  }
+
   return [...found];
 }
 
@@ -159,7 +193,7 @@ async function fetchFsanzPage(page: number): Promise<RecallEntry[]> {
         reason: reason || "Official FSANZ Australian food recall",
         states,
         affectedAllergens: extractAllergens(fullText),
-        affectedBarcodes: [],
+        affectedBarcodes: extractBarcodesFromText(fullText),
         recallUrl,
         isActive: true,
       });
@@ -172,10 +206,15 @@ async function fetchFsanzPage(page: number): Promise<RecallEntry[]> {
   }
 }
 
-async function enrichFsanzMissingStates(recalls: RecallEntry[], maxLookups = 84): Promise<void> {
-  const targets = recalls
-    .filter((r) => r.agency === "FSANZ" && (!r.states || r.states.length === 0) && r.recallUrl.startsWith(FSANZ_BASE))
-    .slice(0, maxLookups);
+async function enrichFsanzDetails(recalls: RecallEntry[], maxLookups = 84): Promise<void> {
+  const candidates = recalls.filter(
+    (r) => r.agency === "FSANZ" && r.recallUrl.startsWith(FSANZ_BASE)
+  );
+  // Prioritize cards missing state pills first, then enrich remaining notices for EAN/APN barcodes & allergens
+  const targets = [
+    ...candidates.filter((r) => !r.states || r.states.length === 0),
+    ...candidates.filter((r) => r.states && r.states.length > 0 && r.affectedBarcodes.length === 0),
+  ].slice(0, maxLookups);
 
   const concurrency = 10;
   for (let i = 0; i < targets.length; i += concurrency) {
@@ -191,17 +230,23 @@ async function enrichFsanzMissingStates(recalls: RecallEntry[], maxLookups = 84)
           const html = await r.text();
           const $ = cheerio.load(html);
           const bodyText = $("main, article, .region-content").first().text().replace(/\s+/g, " ");
-          const states = extractStatesFromText(bodyText);
-          if (states.length > 0) {
-            item.states = states;
-            if (!/\bStates:/i.test(item.reason)) {
-              item.reason = [item.reason, `States: ${states.join(", ")}`].filter(Boolean).join(" · ");
+          if (!item.states || item.states.length === 0) {
+            const states = extractStatesFromText(bodyText);
+            if (states.length > 0) {
+              item.states = states;
+              if (!/\bStates:/i.test(item.reason)) {
+                item.reason = [item.reason, `States: ${states.join(", ")}`].filter(Boolean).join(" · ");
+              }
             }
           }
-          // Also enrich allergens from full official notice text
+          // Enrich allergens & EAN/APN barcodes from full official notice text
           const extraAllergens = extractAllergens(bodyText.slice(0, 2500));
           if (extraAllergens.length > 0) {
             item.affectedAllergens = [...new Set([...item.affectedAllergens, ...extraAllergens])];
+          }
+          const extraBarcodes = extractBarcodesFromText(bodyText.slice(0, 8000));
+          if (extraBarcodes.length > 0) {
+            item.affectedBarcodes = [...new Set([...item.affectedBarcodes, ...extraBarcodes])].slice(0, 20);
           }
         } catch {
           // Non-fatal enrichment timeout
@@ -227,8 +272,8 @@ export async function fetchFsanzRecalls(): Promise<RecallEntry[]> {
     }
   }
 
-  // Enrich all FSANZ cards that didn't expose state pills on the listing page
-  await enrichFsanzMissingStates(recalls, 84);
+  // Enrich FSANZ notices with missing state coverage, full-text allergens & EAN/APN barcodes
+  await enrichFsanzDetails(recalls, 84);
   return recalls;
 }
 
@@ -273,7 +318,7 @@ async function fetchNswFoodPage(page: number): Promise<RecallEntry[]> {
         reason: reason.slice(0, 340),
         states: ["NSW"],
         affectedAllergens: extractAllergens(fullText),
-        affectedBarcodes: [],
+        affectedBarcodes: extractBarcodesFromText(fullText),
         recallUrl,
         isActive: true,
       });
@@ -345,7 +390,7 @@ export async function fetchAcccBabyRecalls(): Promise<RecallEntry[]> {
         reason: (reasonRaw || "ACCC baby & children's product safety recall").slice(0, 320),
         states: resolvedStates,
         affectedAllergens: extractAllergens(fullText),
-        affectedBarcodes: [],
+        affectedBarcodes: extractBarcodesFromText(fullText),
         recallUrl,
         isActive: true,
       });
@@ -384,6 +429,7 @@ export async function fetchAllOfficialRecalls(): Promise<RecallEntry[]> {
         existing.reason = [cleanBase, `States: ${mergedStates.join(", ")}`].filter(Boolean).join(" · ");
       }
       existing.affectedAllergens = [...new Set([...existing.affectedAllergens, ...entry.affectedAllergens])];
+      existing.affectedBarcodes = [...new Set([...existing.affectedBarcodes, ...entry.affectedBarcodes])].slice(0, 20);
       return;
     }
 

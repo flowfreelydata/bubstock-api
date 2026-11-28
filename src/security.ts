@@ -40,8 +40,10 @@ oyFraWVIyd/dganmrduC1bmTBGwD
 -----END CERTIFICATE-----`;
 
 const APPLE_APP_ATTEST_ROOT_CA = new crypto.X509Certificate(APPLE_APP_ATTEST_ROOT_CA_PEM);
-// ASN.1 DER encoding of Apple App Attest Nonce Extension OID 1.2.840.113635.100.8.2
-const APPLE_ATTEST_NONCE_OID_DER = Buffer.from("06092a864886f763640802", "hex");
+// ASN.1 DER value hex for Apple App Attest Nonce Extension OID 1.2.840.113635.100.8.2
+const APPLE_ATTEST_NONCE_OID_HEX = "2a864886f763640802";
+// ASN.1 DER value hex for Apple StoreKit 2 / App Store Receipt Signing Leaf OID 1.2.840.113635.100.6.11.1
+const APPLE_STOREKIT_LEAF_OID_HEX = "2a864886f76364060b01";
 // Official Apple App Attest 16-byte AAGUIDs (developer.apple.com/documentation/devicecheck/validating-apps-that-connect-to-your-server)
 const APP_ATTEST_PROD_AAGUID = Buffer.concat([Buffer.from("appattest", "ascii"), Buffer.alloc(7, 0)]);
 const APP_ATTEST_DEV_AAGUID = Buffer.from("appattestdevelop", "ascii");
@@ -54,6 +56,7 @@ const MAX_COUNTER_WINDOWS = 10_000;
 const REPLAY_WINDOW_SIZE = 64;
 const UNATTESTED_VELOCITY_WINDOW_MS = 60_000;
 const UNATTESTED_VELOCITY_LIMIT = 14;
+const SOFT_ATTESTED_VELOCITY_LIMIT = 24;
 const MAX_VELOCITY_TRACKERS = 5_000;
 
 const SCRAPER_BOT_UA_RE =
@@ -69,7 +72,6 @@ export interface RequestSecurityContext {
   isHostile: boolean;
   isTamperedClient: boolean;
   isReplayAttack: boolean;
-  isWidgetClient: boolean;
   useMirage: boolean;
   mirageReason?: string;
 }
@@ -85,6 +87,11 @@ declare global {
 
 // Single-use enrollment challenge cache (challengeHex -> { ipHash, expiresAtMs })
 const challengeCache = new Map<string, { ipHash: string; expiresAtMs: number }>();
+
+// Per-IP daily new key enrollment cap (blocks unlimited self-enrolled software key farming)
+const MAX_ENROLLS_PER_IP_DAY = 12;
+const MAX_ENROLL_IP_TRACKERS = 5_000;
+const ipEnrollTracker = new Map<string, { windowStartMs: number; keys: Set<string> }>();
 
 // Single-use request nonce cache (keyId:nonce -> expiresAtMs)
 const seenNonces = new Map<string, number>();
@@ -156,9 +163,12 @@ function decodeCbor(buf: Buffer): unknown {
       case 5: {
         const len = readUint(addl);
         if (len > 128) throw new Error("cbor_map_too_large");
-        const obj: Record<string, unknown> = {};
+        const obj = Object.create(null) as Record<string, unknown>;
         for (let i = 0; i < len; i++) {
           const k = String(parseValue(depth + 1));
+          if (k === "__proto__" || k === "constructor" || k === "prototype") {
+            throw new Error("cbor_forbidden_key");
+          }
           obj[k] = parseValue(depth + 1);
         }
         return obj;
@@ -176,12 +186,107 @@ function decodeCbor(buf: Buffer): unknown {
   return parseValue(0);
 }
 
+// ─── Minimal Zero-Dependency ASN.1 DER X.509 Extension Parser ───────────────
+
+interface DerNode {
+  tag: number;
+  valueStart: number;
+  valueEnd: number;
+  end: number;
+}
+
+function readDerNode(buf: Buffer, offset: number, limit = buf.length): DerNode | null {
+  if (offset < 0 || offset + 2 > limit) return null;
+  const tag = buf[offset];
+  const lenByte = buf[offset + 1];
+  let len = 0;
+  let headerLen = 2;
+  if ((lenByte & 0x80) === 0) {
+    len = lenByte;
+  } else {
+    const numOctets = lenByte & 0x7f;
+    if (numOctets === 0 || numOctets > 3 || offset + 2 + numOctets > limit) return null;
+    for (let i = 0; i < numOctets; i++) {
+      len = len * 256 + buf[offset + 2 + i];
+    }
+    headerLen = 2 + numOctets;
+  }
+  const valueStart = offset + headerLen;
+  const valueEnd = valueStart + len;
+  if (valueEnd > limit || len < 0) return null;
+  return { tag, valueStart, valueEnd, end: valueEnd };
+}
+
+function parseX509Extensions(certRaw: Buffer): Map<string, Buffer> {
+  const out = new Map<string, Buffer>();
+  const certSeq = readDerNode(certRaw, 0);
+  if (!certSeq || certSeq.tag !== 0x30) return out;
+  const tbsSeq = readDerNode(certRaw, certSeq.valueStart, certSeq.valueEnd);
+  if (!tbsSeq || tbsSeq.tag !== 0x30) return out;
+
+  let cursor = tbsSeq.valueStart;
+  let extWrapper: DerNode | null = null;
+  while (cursor < tbsSeq.valueEnd) {
+    const child = readDerNode(certRaw, cursor, tbsSeq.valueEnd);
+    if (!child) return out;
+    if (child.tag === 0xa3) {
+      extWrapper = child;
+      break;
+    }
+    cursor = child.end;
+  }
+  if (!extWrapper) return out;
+
+  const extSeq = readDerNode(certRaw, extWrapper.valueStart, extWrapper.valueEnd);
+  if (!extSeq || extSeq.tag !== 0x30) return out;
+
+  let extCursor = extSeq.valueStart;
+  while (extCursor < extSeq.valueEnd) {
+    const ext = readDerNode(certRaw, extCursor, extSeq.valueEnd);
+    if (!ext || ext.tag !== 0x30) break;
+    const oidNode = readDerNode(certRaw, ext.valueStart, ext.valueEnd);
+    if (oidNode && oidNode.tag === 0x06) {
+      let valNode = readDerNode(certRaw, oidNode.end, ext.valueEnd);
+      if (valNode && valNode.tag === 0x01) {
+        valNode = readDerNode(certRaw, valNode.end, ext.valueEnd);
+      }
+      if (valNode && valNode.tag === 0x04) {
+        const oidHex = certRaw.subarray(oidNode.valueStart, oidNode.valueEnd).toString("hex");
+        out.set(oidHex, certRaw.subarray(valNode.valueStart, valNode.valueEnd));
+      }
+    }
+    extCursor = ext.end;
+  }
+  return out;
+}
+
+function extractAppAttestNonce(certRaw: Buffer): Buffer | null {
+  const exts = parseX509Extensions(certRaw);
+  const extVal = exts.get(APPLE_ATTEST_NONCE_OID_HEX);
+  if (!extVal) return null;
+  const outerSeq = readDerNode(extVal, 0);
+  if (!outerSeq || outerSeq.tag !== 0x30) return null;
+  let cursor = outerSeq.valueStart;
+  while (cursor < outerSeq.valueEnd) {
+    const field = readDerNode(extVal, cursor, outerSeq.valueEnd);
+    if (!field) return null;
+    if (field.tag === 0xa1) {
+      const oct = readDerNode(extVal, field.valueStart, field.valueEnd);
+      if (oct && oct.tag === 0x04) {
+        return extVal.subarray(oct.valueStart, oct.valueEnd);
+      }
+    }
+    cursor = field.end;
+  }
+  return null;
+}
+
 /**
  * Cryptographically verifies an Apple `DCAppAttestService` CBOR attestation object:
  * 1. Decodes CBOR map (`fmt === "apple-appattest"`, `attStmt.x5c[]`, `authData`).
- * 2. Verifies `credCert -> intermediateCert -> pinned APPLE_APP_ATTEST_ROOT_CA`.
+ * 2. Verifies `credCert -> intermediateCert -> pinned APPLE_APP_ATTEST_ROOT_CA` + CA basic constraints.
  * 3. Verifies certificate validity windows.
- * 4. Verifies Apple App Attest Nonce OID `1.2.840.113635.100.8.2` embeds `SHA256(authData || SHA256(challenge))`.
+ * 4. Strictly parses ASN.1 X.509 Extension OID `1.2.840.113635.100.8.2` to verify `SHA256(authData || SHA256(challenge:keyId))`.
  * 5. When `APPLE_TEAM_ID` is configured, verifies `authData[0..32]` equals `SHA256("<TEAM_ID>.au.com.bubstock.app")`.
  */
 export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string, keyId: string): boolean {
@@ -197,16 +302,19 @@ export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string, ke
     // authData must contain rpIdHash(32) + flags(1) + signCount(4) + aaguid(16) + credIdLen(2) + credId(>=32)
     if (!Buffer.isBuffer(decoded.authData) || decoded.authData.length < 87) return false;
     const x5c = decoded.attStmt?.x5c;
-    if (!Array.isArray(x5c) || x5c.length < 2) return false;
+    if (!Array.isArray(x5c) || x5c.length < 2 || x5c.length > 5) return false;
 
     const certs: crypto.X509Certificate[] = [];
-    for (const item of x5c.slice(0, 4)) {
+    for (const item of x5c) {
       if (!Buffer.isBuffer(item) || item.length < 100) return false;
       certs.push(new crypto.X509Certificate(item));
     }
 
-    // Leaf credential certificate must not be a CA
+    // Leaf credential certificate must NOT be a CA; all intermediate/root certificates MUST be CAs
     if (certs[0].ca) return false;
+    for (let i = 1; i < certs.length; i++) {
+      if (!certs[i].ca) return false;
+    }
 
     const now = Date.now();
     for (const cert of certs) {
@@ -225,19 +333,21 @@ export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string, ke
       top.verify(APPLE_APP_ATTEST_ROOT_CA.publicKey);
     if (!chainsToPinnedAppleRoot) return false;
 
-    // Verify Apple App Attest Nonce extension cryptographically commits to BOTH the challenge AND enrolled keyId:
-    // SHA256(authData || SHA256(challenge + ":" + keyId)) — prevents splicing a valid App Attest CBOR onto a rogue software key.
+    // Strictly parse ASN.1 DER Extension 1.2.840.113635.100.8.2 and verify bound nonce via constant-time compare
     const boundClientDataHash = crypto.createHash("sha256").update(`${challenge}:${keyId}`, "utf8").digest();
     const expectedBoundNonce = crypto
       .createHash("sha256")
       .update(Buffer.concat([decoded.authData, boundClientDataHash]))
       .digest();
 
-    const credRaw = certs[0].raw;
-    const oidPos = credRaw.indexOf(APPLE_ATTEST_NONCE_OID_DER);
-    if (oidPos === -1) return false;
-    const extWindow = credRaw.subarray(oidPos, Math.min(credRaw.length, oidPos + 96));
-    if (extWindow.indexOf(expectedBoundNonce) === -1) return false;
+    const extractedNonce = extractAppAttestNonce(certs[0].raw);
+    if (
+      !extractedNonce ||
+      extractedNonce.length !== expectedBoundNonce.length ||
+      !crypto.timingSafeEqual(extractedNonce, expectedBoundNonce)
+    ) {
+      return false;
+    }
 
     // Apple App Attest Step 5: initial attestation signCount MUST be 0
     const signCount = decoded.authData.readUInt32BE(33);
@@ -303,11 +413,11 @@ export function issueAttestChallenge(ipHash: string): { challenge: string; expir
   return { challenge, expiresInSeconds: Math.round(CHALLENGE_TTL_MS / 1000) };
 }
 
-export function consumeAttestChallenge(challenge: string): boolean {
+export function consumeAttestChallenge(challenge: string, ipHash: string): boolean {
   const rec = challengeCache.get(challenge);
   if (!rec) return false;
   challengeCache.delete(challenge);
-  return rec.expiresAtMs > Date.now();
+  return rec.expiresAtMs > Date.now() && rec.ipHash === ipHash;
 }
 
 export function rawP256PublicKeyToPem(rawX963: Buffer): string | null {
@@ -352,7 +462,7 @@ export async function enrollHardwareKey(params: {
     return { ok: false, status: 400, error: "Invalid hardware attestation enrollment payload" };
   }
 
-  if (!consumeAttestChallenge(challenge)) {
+  if (!consumeAttestChallenge(challenge, params.ipHash)) {
     return { ok: false, status: 403, error: "Attestation challenge expired or already used" };
   }
 
@@ -374,18 +484,45 @@ export async function enrollHardwareKey(params: {
     return { ok: false, status: 403, error: "Hardware challenge signature verification failed" };
   }
 
+  const existing = await loadAttestedKey(keyId);
+  if (existing && existing.publicKeyPem !== publicKeyPem) {
+    return { ok: false, status: 403, error: "Key identifier mismatch" };
+  }
+
+  // Rate-cap distinct new hardware key enrollments per IP per 24h (anti-Sybil key farming)
+  if (!existing) {
+    const nowMs = Date.now();
+    let ipRec = ipEnrollTracker.get(params.ipHash);
+    if (!ipRec || nowMs - ipRec.windowStartMs > 24 * 3600 * 1000) {
+      if (ipEnrollTracker.size >= MAX_ENROLL_IP_TRACKERS && !ipEnrollTracker.has(params.ipHash)) {
+        const oldest = ipEnrollTracker.keys().next().value;
+        if (oldest) ipEnrollTracker.delete(oldest);
+      }
+      ipRec = { windowStartMs: nowMs, keys: new Set<string>() };
+      ipEnrollTracker.set(params.ipHash, ipRec);
+    }
+    if (!ipRec.keys.has(keyId) && ipRec.keys.size >= MAX_ENROLLS_PER_IP_DAY) {
+      markHostileIp(params.ipHash, "excessive_key_enrollments", 70, { path: "/attest/enroll", method: "POST" });
+      return { ok: false, status: 429, error: "Daily device enrollment limit reached for this network" };
+    }
+    ipRec.keys.add(keyId);
+  }
+
   const hasValidAppleAttest = verifyAppleAppAttestCbor(params.appAttestObjectB64, challenge, keyId);
   const rawMode = typeof params.attestMode === "string" ? params.attestMode : "secure_enclave";
-  const attestMode: AttestedKeyRecord["attestMode"] = hasValidAppleAttest
+  const candidateMode: AttestedKeyRecord["attestMode"] = hasValidAppleAttest
     ? "app_attest"
     : rawMode === "dev_keychain"
       ? "dev_keychain"
       : "secure_enclave";
+  const attestMode: AttestedKeyRecord["attestMode"] =
+    existing?.attestMode === "app_attest" ? "app_attest" : candidateMode;
 
   // Silent SEAR trap: if a re-signed IPA clone enrolls with a different bundleId, DO NOT reject!
   // Accept enrollment silently with taintMask = 1 so every subsequent request hits the Ghost Mirage!
   const bundleTampered = bundleId !== "au.com.bubstock.app";
-  const taintMask = bundleTampered ? 1 : 0;
+  const taintMask = (existing?.taintMask ?? 0) | (bundleTampered ? 1 : 0);
+  const preservedCounter = existing ? existing.lastCounter : 0;
   if (bundleTampered) {
     markHostileIp(params.ipHash, `resigned_bundle_${bundleId.slice(0, 32)}`, 100, {
       path: "/attest/enroll",
@@ -397,18 +534,20 @@ export async function enrollHardwareKey(params: {
     keyId,
     publicKeyPem,
     attestMode,
-    appAttestCbor: hasValidAppleAttest ? String(params.appAttestObjectB64) : undefined,
+    appAttestCbor: hasValidAppleAttest ? String(params.appAttestObjectB64) : existing?.appAttestCbor,
     bundleId,
-    lastCounter: 0,
+    lastCounter: preservedCounter,
     taintMask,
     enrolledIpHash: params.ipHash,
   });
 
-  if (counterWindows.size >= MAX_COUNTER_WINDOWS && !counterWindows.has(keyId)) {
-    const oldest = counterWindows.keys().next().value;
-    if (oldest) counterWindows.delete(oldest);
+  if (!counterWindows.has(keyId)) {
+    if (counterWindows.size >= MAX_COUNTER_WINDOWS) {
+      const oldest = counterWindows.keys().next().value;
+      if (oldest) counterWindows.delete(oldest);
+    }
+    counterWindows.set(keyId, { highest: preservedCounter, seen: new Set<number>() });
   }
-  counterWindows.set(keyId, { highest: 0, seen: new Set<number>() });
   return { ok: true, status: 201, mode: attestMode };
 }
 
@@ -457,17 +596,48 @@ function checkAndRecordNonce(keyId: string, nonce: string): boolean {
   return true;
 }
 
-function checkUnattestedScraperVelocity(ipHash: string, req: Request): boolean {
-  if (
-    req.path !== "/prices" &&
-    req.path !== "/compare" &&
-    req.path !== "/specials" &&
-    req.path !== "/compare/gaps"
-  ) {
+const VELOCITY_TRACKED_PATHS = new Set<string>([
+  "/prices",
+  "/compare",
+  "/specials",
+  "/compare/gaps",
+  "/prices/history",
+  "/pulse",
+  "/melbourne/pulse",
+  "/recalls",
+  "/stores",
+]);
+
+function normalizeRoutePath(rawPath: string): string {
+  const p = rawPath.toLowerCase().replace(/\/+$/, "");
+  return p || "/";
+}
+
+function firstQueryString(val: unknown): string {
+  if (typeof val === "string") return val;
+  if (Array.isArray(val) && typeof val[0] === "string") return val[0];
+  return "";
+}
+
+function checkUnattestedScraperVelocity(ipHash: string, req: Request, limit = UNATTESTED_VELOCITY_LIMIT): boolean {
+  const normPath = normalizeRoutePath(req.path);
+  if (!VELOCITY_TRACKED_PATHS.has(normPath)) {
     return false;
   }
   const now = Date.now();
-  const targetKey = `${req.path}:${String(req.query.product ?? req.query.category ?? "all").toLowerCase().slice(0, 48)}`;
+  const minLat = firstQueryString(req.query.minLat);
+  const minLon = firstQueryString(req.query.minLon);
+  const bboxKey =
+    minLat && minLon
+      ? `bbox:${Math.round(Number(minLat) * 4) || 0},${Math.round(Number(minLon) * 4) || 0}`
+      : "";
+  const targetVal =
+    firstQueryString(req.query.product) ||
+    firstQueryString(req.query.category) ||
+    bboxKey ||
+    firstQueryString(req.query.state) ||
+    "all";
+  const targetKey = `${normPath}:${targetVal.toLowerCase().slice(0, 48)}`;
   let tracker = unattestedVelocity.get(ipHash);
   if (!tracker || now - tracker.windowStartMs > UNATTESTED_VELOCITY_WINDOW_MS) {
     if (unattestedVelocity.size >= MAX_VELOCITY_TRACKERS && !unattestedVelocity.has(ipHash)) {
@@ -478,20 +648,27 @@ function checkUnattestedScraperVelocity(ipHash: string, req: Request): boolean {
     unattestedVelocity.set(ipHash, tracker);
   }
   tracker.keys.add(targetKey);
-  return tracker.keys.size > UNATTESTED_VELOCITY_LIMIT;
+  return tracker.keys.size > limit;
 }
 
-function expectedIntegrityToken(keyId: string, kind: "ok" | "tainted", nonce: string, counter: number): string {
-  return crypto
-    .createHmac("sha256", keyId)
-    .update(`${kind}:${nonce}:${counter}`)
-    .digest("hex")
-    .slice(0, 16);
-}
-
-function timingSafeHexEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+function verifyIntegritySignature(
+  publicKeyPem: string,
+  integrityHeader: string,
+  nonce: string,
+  counter: number
+): "ok" | "tainted" | "forged" {
+  if (!integrityHeader) return "forged";
+  const sigBuf = Buffer.from(integrityHeader, "base64");
+  if (sigBuf.length !== 64 && (sigBuf.length < 68 || sigBuf.length > 74)) {
+    return "forged";
+  }
+  if (verifyP256Signature(publicKeyPem, Buffer.from(`ok:${nonce}:${counter}`, "utf8"), sigBuf)) {
+    return "ok";
+  }
+  if (verifyP256Signature(publicKeyPem, Buffer.from(`tainted:${nonce}:${counter}`, "utf8"), sigBuf)) {
+    return "tainted";
+  }
+  return "forged";
 }
 
 // ─── Global Request Security Classifier & Hardware Signature Verifier ───────
@@ -504,11 +681,7 @@ export async function securityContextMiddleware(
   const ipHash = hashIp(req.ip);
   const ua = String(req.headers["user-agent"] ?? "");
   const isScraperUa = SCRAPER_BOT_UA_RE.test(ua);
-  const isWidgetClient =
-    String(req.headers["x-bubstock-client"] ?? "").toLowerCase() === "ios-widget" &&
-    (req.path === "/specials" || req.path === "/pulse") &&
-    req.query.product === undefined;
-
+  const normPath = normalizeRoutePath(req.path);
   const ctx: RequestSecurityContext = {
     ipHash,
     isAttested: false,
@@ -518,7 +691,6 @@ export async function securityContextMiddleware(
     isHostile: isHostileIp(ipHash),
     isTamperedClient: false,
     isReplayAttack: false,
-    isWidgetClient,
     useMirage: false,
   };
 
@@ -527,7 +699,7 @@ export async function securityContextMiddleware(
   const nonce = String(req.headers["x-bubstock-nonce"] ?? "").trim().toLowerCase();
   const counterRaw = String(req.headers["x-bubstock-counter"] ?? "").trim();
   const sigB64 = String(req.headers["x-bubstock-sig"] ?? "").trim();
-  const integrityToken = String(req.headers["x-bubstock-integrity"] ?? "").trim().toLowerCase();
+  const integritySig = String(req.headers["x-bubstock-integrity"] ?? "").trim();
 
   if (keyId && tsRaw && nonce && counterRaw && sigB64) {
     const ts = Number(tsRaw);
@@ -535,15 +707,10 @@ export async function securityContextMiddleware(
     const now = Date.now();
 
     if (!Number.isFinite(ts) || Math.abs(now - ts) > TIMESTAMP_DRIFT_MS) {
+      // Clock skew on a phone must never ban a shared IP or poison prices — simply mark unattested.
       ctx.isReplayAttack = true;
-      ctx.useMirage = true;
-      ctx.mirageReason = "replay_stale_timestamp";
-      markHostileIp(ipHash, "replay_stale_timestamp", 80, { path: req.path, method: req.method, userAgent: ua });
-    } else if (!/^[a-f0-9]{16,64}$/.test(nonce) || !checkAndRecordNonce(keyId, nonce)) {
+    } else if (!/^[a-f0-9]{16,64}$/.test(nonce)) {
       ctx.isReplayAttack = true;
-      ctx.useMirage = true;
-      ctx.mirageReason = "replay_duplicate_nonce";
-      markHostileIp(ipHash, "replay_duplicate_nonce", 90, { path: req.path, method: req.method, userAgent: ua });
     } else {
       const rec = await loadAttestedKey(keyId);
       if (!rec) {
@@ -554,57 +721,58 @@ export async function securityContextMiddleware(
           .createHash("sha256")
           .update(req.rawBody ?? Buffer.alloc(0))
           .digest("hex");
-        const canonical = `${req.method.toUpperCase()}|${req.path}|${tsRaw}|${nonce}|${counterRaw}|${bodyHash}`;
+        const sigVersion = String(req.headers["x-bubstock-sig-v"] ?? "").trim();
+        const rawUrl = req.originalUrl || req.url || req.path;
+        const isPrivateSignedGet =
+          req.method.toUpperCase() === "GET" &&
+          (normPath === "/alerts/check" ||
+            normPath === "/referrals/status" ||
+            normPath.startsWith("/groups/") ||
+            normPath.startsWith("/household/sync/") ||
+            normPath.startsWith("/relay/"));
         const sigBuf = Buffer.from(sigB64, "base64");
-        const sigValid = verifyP256Signature(rec.publicKeyPem, Buffer.from(canonical, "utf8"), sigBuf);
+        let sigValid = false;
+        let v3IntegrityVerdict: "ok" | "tainted" | null = null;
+        if (sigVersion === "3") {
+          // Single-signature v3 folds integrity tag directly into the canonical request signature (50% less Secure Enclave IPC!)
+          const baseV3 = `${req.method.toUpperCase()}|${rawUrl}|${tsRaw}|${nonce}|${counterRaw}|${bodyHash}`;
+          if (verifyP256Signature(rec.publicKeyPem, Buffer.from(`${baseV3}|ok`, "utf8"), sigBuf)) {
+            sigValid = true;
+            v3IntegrityVerdict = "ok";
+          } else if (verifyP256Signature(rec.publicKeyPem, Buffer.from(`${baseV3}|tainted`, "utf8"), sigBuf)) {
+            sigValid = true;
+            v3IntegrityVerdict = "tainted";
+          }
+        } else if (sigVersion === "2") {
+          const canonicalV2 = `${req.method.toUpperCase()}|${rawUrl}|${tsRaw}|${nonce}|${counterRaw}|${bodyHash}`;
+          sigValid = verifyP256Signature(rec.publicKeyPem, Buffer.from(canonicalV2, "utf8"), sigBuf);
+        } else if (!(isPrivateSignedGet && rawUrl.includes("?"))) {
+          const canonicalV1 = `${req.method.toUpperCase()}|${req.path}|${tsRaw}|${nonce}|${counterRaw}|${bodyHash}`;
+          sigValid = verifyP256Signature(rec.publicKeyPem, Buffer.from(canonicalV1, "utf8"), sigBuf);
+        }
 
         if (!sigValid) {
           ctx.isReplayAttack = true;
-          ctx.useMirage = true;
-          ctx.mirageReason = "invalid_hardware_signature";
-          markHostileIp(ipHash, "invalid_hardware_signature", 85, {
-            path: req.path,
-            method: req.method,
-            userAgent: ua,
-          });
+          res.setHeader("X-Bubstock-Reenroll", "1");
+        } else if (!checkAndRecordNonce(keyId, nonce)) {
+          ctx.isReplayAttack = true;
         } else if (!checkSlidingReplayWindow(keyId, rec.lastCounter, counter)) {
           ctx.isReplayAttack = true;
-          ctx.useMirage = true;
-          ctx.mirageReason = "counter_rollback_replay";
-          markHostileIp(ipHash, "counter_rollback_replay", 90, {
-            path: req.path,
-            method: req.method,
-            userAgent: ua,
-          });
         } else {
-          // Valid signed request! Now silently inspect SEAR runtime integrity bit
+          // Valid signed request! Verify ECDSA-signed runtime integrity claim (unforgeable without private key)
           ctx.isAttested = true;
           ctx.attestMode = rec.attestMode;
           ctx.isAppleHardwareVerified = rec.attestMode === "app_attest";
           ctx.keyId = keyId;
 
-          const taintedExpected = expectedIntegrityToken(keyId, "tainted", nonce, counter);
-          const cleanExpected = expectedIntegrityToken(keyId, "ok", nonce, counter);
-          const sentTaint =
-            integrityToken.length === 16 && timingSafeHexEqual(integrityToken, taintedExpected);
-          const forgedIntegrity =
-            integrityToken.length > 0 &&
-            !sentTaint &&
-            !(integrityToken.length === 16 && timingSafeHexEqual(integrityToken, cleanExpected));
+          const integrityVerdict =
+            v3IntegrityVerdict ?? verifyIntegritySignature(rec.publicKeyPem, integritySig, nonce, counter);
+          const sentTaint = integrityVerdict === "tainted";
+          const forgedIntegrity = integrityVerdict === "forged";
 
           if (sentTaint || forgedIntegrity || rec.taintMask > 0) {
             ctx.isTamperedClient = true;
-            ctx.useMirage = true;
-            ctx.mirageReason = sentTaint
-              ? "runtime_tamper_signal"
-              : forgedIntegrity
-                ? "forged_integrity_token"
-                : "sticky_tainted_key";
-            markHostileIp(ipHash, ctx.mirageReason, 100, {
-              path: req.path,
-              method: req.method,
-              userAgent: ua,
-            });
+            ctx.isAttested = false;
             updateAttestedKeyState(keyId, counter, 1).catch(() => {});
           } else {
             updateAttestedKeyState(keyId, counter, 0).catch(() => {});
@@ -612,33 +780,13 @@ export async function securityContextMiddleware(
         }
       }
     }
-  } else if (!isWidgetClient && checkUnattestedScraperVelocity(ipHash, req)) {
-    // High-velocity unattested harvester spoofing a browser/iPhone UA -> trap in Ghost Mirage!
-    ctx.useMirage = true;
-    ctx.mirageReason = "unattested_velocity_scrape";
-    markHostileIp(ipHash, "unattested_velocity_scrape", 75, {
-      path: req.path,
-      method: req.method,
-      userAgent: ua,
-    });
   }
 
-  // Strict CGNAT override: ONLY truly Apple-PKI-verified `app_attest` hardware keys may override
-  // an IP-level hostile ban — self-enrolled software/unattested keys CANNOT escape a hostile IP ban!
-  const verifiedAppleHardware =
-    ctx.isAppleHardwareVerified && !ctx.isTamperedClient && !ctx.isReplayAttack && !ctx.isScraperUa;
-
-  if (!ctx.useMirage && !verifiedAppleHardware && (ctx.isHostile || ctx.isScraperUa)) {
-    ctx.useMirage = true;
-    ctx.mirageReason = ctx.isHostile ? "hostile_fingerprint" : "automated_scraper_ua";
-    if (ctx.isScraperUa && !ctx.isHostile) {
-      markHostileIp(ipHash, "automated_scraper_ua", 55, {
-        path: req.path,
-        method: req.method,
-        userAgent: ua,
-      });
-    }
-  }
+  // IMPORTANT (ACCC & Customer Accuracy Guarantee):
+  // NEVER serve fabricated/drifted "Ghost Mirage" prices to ANY caller on HTTP 200 OK.
+  // Abuse and scraper UAs are handled cleanly via honest HTTP 403 / 429 rate limits,
+  // never by returning misleading grocery/formula prices or banning shared AU CGNAT IPs.
+  ctx.useMirage = false;
 
   req.security = ctx;
   next();
@@ -649,13 +797,16 @@ export async function securityContextMiddleware(
 export interface StoreKitVerificationResult {
   valid: boolean;
   productId?: string;
+  originalTransactionId?: string;
   environment?: string;
   expiresDate?: number;
   reason?: string;
 }
 
 export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResult {
-  if (typeof jws !== "string") return { valid: false, reason: "missing_jws" };
+  if (typeof jws !== "string" || jws.length < 100 || jws.length > 24_000) {
+    return { valid: false, reason: "invalid_jws_size" };
+  }
   const parts = jws.trim().split(".");
   if (parts.length !== 3) return { valid: false, reason: "malformed_jws" };
 
@@ -667,12 +818,14 @@ export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResul
     const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as {
       bundleId?: string;
       productId?: string;
+      originalTransactionId?: string | number;
+      transactionId?: string | number;
       expiresDate?: number;
       revocationDate?: number;
       environment?: string;
     };
 
-    if (header.alg !== "ES256" || !Array.isArray(header.x5c) || header.x5c.length < 2) {
+    if (header.alg !== "ES256" || !Array.isArray(header.x5c) || header.x5c.length < 2 || header.x5c.length > 5) {
       return { valid: false, reason: "invalid_jws_header_or_x5c" };
     }
     if (payload.bundleId !== "au.com.bubstock.app") {
@@ -700,7 +853,7 @@ export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResul
     // Parse & verify EVERY certificate's date window inside x5c
     const certs: crypto.X509Certificate[] = [];
     const now = Date.now();
-    for (const rawCert of header.x5c.slice(0, 4)) {
+    for (const rawCert of header.x5c) {
       if (typeof rawCert !== "string" || rawCert.length < 100) {
         return { valid: false, reason: "invalid_cert_entry" };
       }
@@ -714,6 +867,17 @@ export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResul
     if (certs[0].ca) {
       return { valid: false, reason: "leaf_cert_cannot_be_ca" };
     }
+    for (let i = 1; i < certs.length; i++) {
+      if (!certs[i].ca) {
+        return { valid: false, reason: "intermediate_or_root_must_be_ca" };
+      }
+    }
+
+    // Leaf cert must carry Apple's official StoreKit / App Store Receipt Signing extension OID (1.2.840.113635.100.6.11.1)
+    const leafExtensions = parseX509Extensions(certs[0].raw);
+    if (!leafExtensions.has(APPLE_STOREKIT_LEAF_OID_HEX)) {
+      return { valid: false, reason: "missing_apple_storekit_leaf_oid" };
+    }
 
     // Verify EVERY cryptographic link in the x5c chain
     for (let i = 0; i < certs.length - 1; i++) {
@@ -723,7 +887,6 @@ export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResul
     }
 
     // CRITICAL: Pin the root certificate directly to official Apple Root CA - G3 / G2 SHA-256 fingerprints
-    // (Rejects any self-signed forged certificate even if CN="Apple Root CA"!)
     const rootCert = certs[certs.length - 1];
     const rootFp = rootCert.fingerprint256.toUpperCase();
     if (!PINNED_APPLE_STOREKIT_ROOT_FINGERPRINTS.has(rootFp) || !rootCert.verify(rootCert.publicKey)) {
@@ -747,9 +910,14 @@ export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResul
       return { valid: false, reason: "es256_signature_mismatch" };
     }
 
+    const rawOrigId = payload.originalTransactionId ?? payload.transactionId;
+    const originalTransactionId =
+      rawOrigId !== undefined && rawOrigId !== null ? String(rawOrigId).trim().slice(0, 80) : undefined;
+
     return {
       valid: true,
       productId: payload.productId,
+      originalTransactionId: originalTransactionId || undefined,
       environment: payload.environment ?? "Production",
       expiresDate: payload.expiresDate,
     };
