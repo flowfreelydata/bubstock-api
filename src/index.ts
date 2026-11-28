@@ -52,6 +52,7 @@ import {
   getHouseholdVault,
   registerReferralCode,
   redeemReferralCode,
+  getReferralCodeOwnerStatus,
   hasDeviceVerifiedPromoOrReferral,
   createMothersGroup,
   joinMothersGroup,
@@ -77,6 +78,8 @@ import {
 } from "./security.js";
 import {
   applyProgressiveTarpit,
+  buildSyntheticMirageComparison,
+  buildSyntheticMiragePrices,
   clearHostileIp,
   hashIp,
   mountHoneypotRoutes,
@@ -393,7 +396,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "3.1.0",
+    version: "3.2.0",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
@@ -496,7 +499,7 @@ app.get("/admin/security/summary", async (req: Request, res: Response) => {
   res.setHeader("Cache-Control", "no-store, private");
   res.json({
     service: "bubstock-au-api",
-    version: "3.1.0",
+    version: "3.2.0",
     ...summary,
     generatedAt: new Date().toISOString(),
   });
@@ -744,6 +747,19 @@ app.get("/prices", antiLeechGuard, priceLimit, async (req: Request, res: Respons
   const ctx = resolveCityAndState(req);
   const cleanSuburb = sanitizeText(req.query.suburb, 60) || ctx.defaultSuburb;
 
+  // Short-circuit BEFORE live upstream retailer scrapes when caller is flagged hostile/mirage:
+  // prevents bots from forcing 5 outbound scrapes, evicting real parents' priceCache, or polluting DB!
+  if (req.security?.useMirage) {
+    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
+    const warm = priceCache.get(`${cleanProduct.toLowerCase()}|${ctx.state}`);
+    const payload = warm
+      ? transformToGhostPrices({ ...warm, suburb: cleanSuburb }, req.security.ipHash)
+      : buildSyntheticMiragePrices(cleanProduct, cleanSuburb, ctx.state, req.security.ipHash);
+    res.setHeader("Cache-Control", "no-store, private");
+    res.json(payload);
+    return;
+  }
+
   log("info", "live price lookup", {
     product: cleanProduct,
     suburb: cleanSuburb,
@@ -752,12 +768,6 @@ app.get("/prices", antiLeechGuard, priceLimit, async (req: Request, res: Respons
   });
 
   const result = await resolveMultiRetailerPrices(cleanProduct, cleanSuburb, ctx.state);
-  if (req.security?.useMirage) {
-    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
-    res.setHeader("Cache-Control", "no-store, private");
-    res.json(transformToGhostPrices(result, req.security.ipHash));
-    return;
-  }
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300, stale-while-revalidate=900");
   res.json(result);
 });
@@ -773,6 +783,14 @@ app.get("/compare", antiLeechGuard, priceLimit, async (req: Request, res: Respon
 
   const ctx = resolveCityAndState(req);
   const cleanSuburb = sanitizeText(req.query.suburb, 60) || ctx.defaultSuburb;
+
+  if (req.security?.useMirage) {
+    await applyProgressiveTarpit(req.security.ipHash, req.security.mirageReason);
+    res.setHeader("Cache-Control", "no-store, private");
+    res.json(buildSyntheticMirageComparison(cleanProduct, cleanSuburb, ctx.state, req.security.ipHash));
+    return;
+  }
+
   const result = await resolveMultiRetailerPrices(cleanProduct, cleanSuburb, ctx.state);
 
   const wowPool = result.entries.filter((e) => e.retailer === "Woolworths");
@@ -1519,6 +1537,50 @@ app.post("/promo/submit", sightingLimit, async (req: Request, res: Response) => 
     // Tolerate social platform network timeouts gracefully
   }
 
+  // Verify public oEmbed / OpenGraph caption mentions #Bubstock or the user's invite code
+  // when public metadata is readable (blocks pasting random cat/music videos on YouTube/TikTok/Reddit!)
+  const cleanRefForCheck =
+    typeof referralCode === "string" ? referralCode.trim().toLowerCase().slice(0, 12) : "";
+  try {
+    const hostLower = parsed.hostname.toLowerCase();
+    let oembedUrl: string | null = null;
+    if (hostLower.includes("youtube.com") || hostLower === "youtu.be") {
+      oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(parsed.toString())}&format=json`;
+    } else if (hostLower.includes("tiktok.com")) {
+      oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(parsed.toString())}`;
+    } else if (hostLower.includes("reddit.com")) {
+      oembedUrl = `https://www.reddit.com/oembed?url=${encodeURIComponent(parsed.toString())}`;
+    }
+    if (oembedUrl) {
+      const oe = await fetch(oembedUrl, {
+        method: "GET",
+        redirect: "manual",
+        signal: AbortSignal.timeout(3_500),
+        headers: { Accept: "application/json", "User-Agent": "BubstockLinkCheck/1.0" },
+      });
+      if (oe.status === 404 || oe.status === 401) {
+        res.status(400).json({ error: "That video appears private or not found. Make sure your post is public!" });
+        return;
+      }
+      if (oe.status === 200) {
+        const meta = (await oe.json()) as { title?: string; author_name?: string };
+        const text = `${meta.title ?? ""} ${meta.author_name ?? ""}`.toLowerCase().trim();
+        if (text.length >= 4) {
+          const hasBrand = text.includes("bubstock");
+          const hasCode = cleanRefForCheck.length >= 5 && text.includes(cleanRefForCheck);
+          if (!hasBrand && !hasCode) {
+            res.status(422).json({
+              error: `We couldn't spot #Bubstock${cleanRefForCheck ? ` or your code (${cleanRefForCheck.toUpperCase()})` : ""} in that video's title/caption. Add #Bubstock to your public caption and try again!`,
+            });
+            return;
+          }
+        }
+      }
+    }
+  } catch {
+    // Non-fatal if platform oEmbed is temporarily unreachable
+  }
+
   const cleanUrl = parsed.toString().slice(0, 400);
   const cleanPlatform = typeof platform === "string" && platform.trim() ? platform.trim().slice(0, 40) : "Social";
 
@@ -1899,6 +1961,22 @@ app.post("/referrals/register", strictBotGuard, sightingLimit, async (req: Reque
   res.status(200).json({ registered: true });
 });
 
+app.get("/referrals/status", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
+  const code = sanitizeText(req.query.code, 12);
+  const deviceId = sanitizeText(req.query.deviceId, 80);
+  if (code.length !== 6 || !VALID_DEVICE_ID_RE.test(deviceId)) {
+    res.status(400).json({ error: "Valid 6-char code and UUID deviceId required" });
+    return;
+  }
+  const status = await getReferralCodeOwnerStatus(code, deviceId);
+  res.setHeader("Cache-Control", "no-store, private");
+  if (!status.validOwner) {
+    res.status(403).json({ error: "Code not registered to this device" });
+    return;
+  }
+  res.json({ code: code.toUpperCase(), redeemerCount: status.redeemerCount });
+});
+
 app.post("/referrals/redeem", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
   const code = sanitizeText(req.body?.code, 12);
   const deviceId = sanitizeText(req.body?.deviceId, 80);
@@ -2141,7 +2219,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "3.1.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "3.2.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

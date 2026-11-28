@@ -1410,6 +1410,38 @@ export async function redeemReferralCode(
   return { accepted: true, status: 200, message: "2 months of Bubstock+ Preview unlocked! Welcome aboard." };
 }
 
+export async function getReferralCodeOwnerStatus(
+  code: string,
+  deviceId: string
+): Promise<{ validOwner: boolean; redeemerCount: number }> {
+  const cleanCode = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const ownerHash = hashDeviceId(deviceId);
+  if (cleanCode.length !== 6 || !ownerHash) {
+    return { validOwner: false, redeemerCount: 0 };
+  }
+
+  if (!pool) {
+    const ref = memoryReferrals.get(cleanCode);
+    if (!ref || ref.ownerHash !== ownerHash) return { validOwner: false, redeemerCount: 0 };
+    return { validOwner: true, redeemerCount: ref.redeemers.size };
+  }
+
+  try {
+    const r = await pool.query(
+      `SELECT owner_device_hash, COALESCE(array_length(redeemer_hashes, 1), 0)::INT AS cnt
+       FROM referral_codes WHERE code = $1`,
+      [cleanCode]
+    );
+    if (r.rows.length === 0) return { validOwner: false, redeemerCount: 0 };
+    if (String(r.rows[0].owner_device_hash) !== ownerHash) {
+      return { validOwner: false, redeemerCount: 0 };
+    }
+    return { validOwner: true, redeemerCount: Number(r.rows[0].cnt ?? 0) };
+  } catch {
+    return { validOwner: false, redeemerCount: 0 };
+  }
+}
+
 export async function hasDeviceVerifiedPromoOrReferral(deviceId: string): Promise<boolean> {
   const devHash = hashDeviceId(deviceId);
   if (!devHash) return false;

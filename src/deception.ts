@@ -322,6 +322,109 @@ export function transformToGhostPrices(result: ProductPriceResult, ipHash: strin
   };
 }
 
+/**
+ * Zero-upstream decoy generator for trapped scrapers querying uncached/random strings:
+ * returns a believable multi-retailer ProductPriceResult with ZERO upstream HTTP requests,
+ * ZERO cache eviction, and ZERO PostgreSQL writes.
+ */
+export function buildSyntheticMiragePrices(
+  productName: string,
+  suburb: string,
+  state: string,
+  ipHash: string
+): ProductPriceResult {
+  const nowIso = new Date().toISOString();
+  const baseSeed = `syn:${ipHash}:${dayBucket()}:${productName.toLowerCase()}`;
+  const wowPrice = driftAuPrice(26.0, `${baseSeed}:wow`);
+  const colesPrice = driftAuPrice(27.5, `${baseSeed}:coles`);
+  const skuTag = parseInt(deterministicHex(baseSeed, 6), 16) % 899_999;
+
+  const entries: PriceEntry[] = [
+    {
+      retailer: "Woolworths",
+      storeName: `Woolworths Online (${state})`,
+      suburb,
+      state,
+      matchedName: productName,
+      stockcode: String(100_000 + skuTag),
+      price: wowPrice,
+      currency: "AUD" as const,
+      unit: "each",
+      isOnSale: false,
+      isInStock: true,
+      lastUpdated: nowIso,
+    },
+    {
+      retailer: "Coles",
+      storeName: `Coles Online (${state})`,
+      suburb,
+      state,
+      matchedName: productName,
+      stockcode: String(200_000 + skuTag),
+      price: colesPrice,
+      currency: "AUD" as const,
+      unit: "each",
+      isOnSale: false,
+      isInStock: true,
+      lastUpdated: nowIso,
+    },
+  ].sort((a, b) => a.price - b.price);
+
+  return {
+    productName,
+    suburb,
+    state,
+    entries,
+    retailerStatus: [
+      { retailer: "Woolworths", status: "live", count: 1, latencyMs: 112 },
+      { retailer: "Coles", status: "live", count: 1, latencyMs: 134 },
+      { retailer: "IGA", status: "no_match", count: 0, latencyMs: 88 },
+      { retailer: "Priceline", status: "no_match", count: 0, latencyMs: 95 },
+      { retailer: "ALDI", status: "no_match", count: 0, latencyMs: 74 },
+    ],
+    fetchedAt: nowIso,
+  };
+}
+
+export function buildSyntheticMirageComparison(
+  productName: string,
+  suburb: string,
+  state: string,
+  ipHash: string
+): HeadToHeadComparison {
+  const syn = buildSyntheticMiragePrices(productName, suburb, state, ipHash);
+  const wow = syn.entries.find((e) => e.retailer === "Woolworths") ?? null;
+  const coles = syn.entries.find((e) => e.retailer === "Coles") ?? null;
+  const diff = wow && coles ? Number(Math.abs(wow.price - coles.price).toFixed(2)) : null;
+  const higher = wow && coles ? Math.max(wow.price, coles.price) : 0;
+  const pct = diff !== null && higher > 0 ? Math.round((diff / higher) * 100) : null;
+  const cheaper: "Woolworths" | "Coles" | "Tie" | null =
+    !wow || !coles
+      ? null
+      : diff! < 0.05
+        ? "Tie"
+        : coles.price < wow.price
+          ? "Coles"
+          : "Woolworths";
+  return {
+    query: productName,
+    suburb,
+    state,
+    matchQuality: "exact",
+    woolworths: wow,
+    coles,
+    cheaperRetailer: cheaper,
+    priceDifference: diff,
+    percentDifference: pct,
+    unitSummary:
+      cheaper && cheaper !== "Tie" && diff !== null
+        ? `Save $${diff.toFixed(2)} (${pct}%) at ${cheaper}`
+        : "Identical shelf price",
+    retailerStatus: syn.retailerStatus,
+    fetchedAt: syn.fetchedAt,
+  };
+}
+
 export function transformToGhostSpecials(specials: SpecialEntry[], ipHash: string): SpecialEntry[] {
   const bucket = dayBucket();
   const miraged = specials.map((s) => {
