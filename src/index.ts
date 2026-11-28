@@ -396,7 +396,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "3.3.0",
+    version: "3.4.0",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
@@ -499,7 +499,7 @@ app.get("/admin/security/summary", async (req: Request, res: Response) => {
   res.setHeader("Cache-Control", "no-store, private");
   res.json({
     service: "bubstock-au-api",
-    version: "3.3.0",
+    version: "3.4.0",
     ...summary,
     generatedAt: new Date().toISOString(),
   });
@@ -1268,13 +1268,18 @@ app.get("/stores", antiLeechGuard, dataDumpLimit, async (req: Request, res: Resp
 // ─── Official FSANZ + ACCC Recalls (state-prioritized) ───────────────────────
 
 function toRecallEntry(r: RecallRow): RecallEntry {
+  const agency: RecallEntry["agency"] =
+    r.agency === "ACCC" || r.agency === "NSW Food" || r.agency === "VIC Health"
+      ? r.agency
+      : "FSANZ";
   return {
     id: r.fsanz_id,
-    agency: r.agency === "ACCC" ? "ACCC" : "FSANZ",
+    agency,
     productName: r.product_name,
     brand: r.brand ?? "",
     recallDate: r.recall_date ?? "",
     reason: r.reason ?? "",
+    states: Array.isArray(r.affected_states) ? r.affected_states : [],
     affectedAllergens: r.affected_allergens ?? [],
     affectedBarcodes: r.affected_barcodes ?? [],
     recallUrl: r.recall_url ?? "",
@@ -1288,33 +1293,67 @@ async function getRecallsList(): Promise<{ recalls: RecallEntry[]; source: strin
 
   return singleflight("recalls:all", async () => {
     const dbRecalls = await loadRecalls();
-    if (dbRecalls.length > 0) {
-      const recalls = dbRecalls.map(toRecallEntry);
+    const newestSeenMs = dbRecalls.reduce(
+      (max, row) => Math.max(max, row.last_seen ? new Date(row.last_seen).getTime() : 0),
+      0
+    );
+    const dbIsFreshAndRich =
+      dbRecalls.length >= 30 &&
+      newestSeenMs > 0 &&
+      Date.now() - newestSeenMs < 6 * 60 * 60 * 1000;
+
+    if (dbIsFreshAndRich) {
+      const recalls = dbRecalls
+        .map(toRecallEntry)
+        .sort((a, b) => (Date.parse(b.recallDate) || 0) - (Date.parse(a.recallDate) || 0));
       recallCache.set("all", recalls, 6 * 60 * 60 * 1000);
       return { recalls, source: "database" };
     }
 
-    const recalls = await fetchAllOfficialRecalls();
-    recallCache.set("all", recalls, 6 * 60 * 60 * 1000);
-    upsertRecalls(recalls).catch((e) =>
-      log("error", "upsertRecalls failed", { err: (e as Error).message })
-    );
-    return { recalls, source: "live" };
+    const live = await fetchAllOfficialRecalls();
+    if (live.length > 0) {
+      recallCache.set("all", live, 6 * 60 * 60 * 1000);
+      upsertRecalls(live).catch((e) =>
+        log("error", "upsertRecalls failed", { err: (e as Error).message })
+      );
+      return { recalls: live, source: "live" };
+    }
+
+    if (dbRecalls.length > 0) {
+      const recalls = dbRecalls.map(toRecallEntry);
+      recallCache.set("all", recalls, 30 * 60 * 1000);
+      return { recalls, source: "database" };
+    }
+
+    return { recalls: [], source: "live" };
   });
 }
 
 app.get("/recalls", async (req: Request, res: Response) => {
+  const rawState = String(req.query.state ?? "").trim().toUpperCase();
   const ctx = resolveCityAndState(req);
   const { recalls, source } = await getRecallsList();
-  const stateRe = new RegExp(`\\b(${ctx.state}|National|Australia)\\b`, "i");
-  const sorted = [...recalls].sort((a, b) => {
-    const aHit = stateRe.test(a.reason) ? 1 : 0;
-    const bHit = stateRe.test(b.reason) ? 1 : 0;
-    return bHit - aHit;
-  });
+
+  let sorted = [...recalls];
+  if (rawState !== "ALL") {
+    const targetState = rawState || ctx.state;
+    const stateRe = new RegExp(`\\b(${targetState}|National|Australia)\\b`, "i");
+    sorted.sort((a, b) => {
+      const aHit = (a.states?.includes(targetState) || a.states?.includes("National") || stateRe.test(a.reason)) ? 1 : 0;
+      const bHit = (b.states?.includes(targetState) || b.states?.includes("National") || stateRe.test(b.reason)) ? 1 : 0;
+      if (aHit !== bHit) return bHit - aHit;
+      return (Date.parse(b.recallDate) || 0) - (Date.parse(a.recallDate) || 0);
+    });
+  }
 
   res.setHeader("Cache-Control", "public, max-age=1800, s-maxage=1800");
-  res.json({ recalls: sorted, state: ctx.state, source, fetchedAt: new Date().toISOString() });
+  res.json({
+    recalls: sorted,
+    count: sorted.length,
+    state: rawState === "ALL" ? "ALL" : ctx.state,
+    source,
+    fetchedAt: new Date().toISOString(),
+  });
 });
 
 app.get("/recalls/check", async (req: Request, res: Response) => {
@@ -2243,7 +2282,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "3.3.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "3.4.0", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

@@ -71,11 +71,12 @@ export interface SpecialEntry {
 
 export interface RecallEntry {
   id: string;
-  agency: "FSANZ" | "ACCC";
+  agency: "FSANZ" | "ACCC" | "NSW Food" | "VIC Health";
   productName: string;
   brand: string;
   recallDate: string;
   reason: string;
+  states?: string[];
   affectedAllergens: string[];
   affectedBarcodes: string[];
   recallUrl: string;

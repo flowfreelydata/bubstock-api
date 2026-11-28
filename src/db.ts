@@ -127,6 +127,7 @@ export async function initSchema(): Promise<void> {
       );
 
       ALTER TABLE recall_entries ADD COLUMN IF NOT EXISTS agency TEXT NOT NULL DEFAULT 'FSANZ';
+      ALTER TABLE recall_entries ADD COLUMN IF NOT EXISTS affected_states TEXT[] NOT NULL DEFAULT '{}';
 
       CREATE INDEX IF NOT EXISTS idx_recall_product
         ON recall_entries(lower(product_name));
@@ -634,11 +635,12 @@ export async function loadFreshSpecials(maxAgeHours = 36): Promise<SpecialEntry[
 
 export interface RecallRow {
   fsanz_id: string;
-  agency: "FSANZ" | "ACCC";
+  agency: "FSANZ" | "ACCC" | "NSW Food" | "VIC Health";
   product_name: string;
   brand: string;
   recall_date: string;
   reason: string;
+  affected_states?: string[];
   affected_allergens: string[];
   affected_barcodes: string[];
   recall_url: string;
@@ -654,14 +656,15 @@ export async function upsertRecalls(recalls: RecallEntry[]): Promise<void> {
       await client.query(
         `INSERT INTO recall_entries
            (fsanz_id, agency, product_name, brand, recall_date, reason,
-            affected_allergens, affected_barcodes, recall_url, is_active, last_seen)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+            affected_states, affected_allergens, affected_barcodes, recall_url, is_active, last_seen)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
          ON CONFLICT (fsanz_id) DO UPDATE
            SET agency             = EXCLUDED.agency,
                product_name       = EXCLUDED.product_name,
                brand              = EXCLUDED.brand,
                recall_date        = EXCLUDED.recall_date,
                reason             = EXCLUDED.reason,
+               affected_states    = EXCLUDED.affected_states,
                affected_allergens = EXCLUDED.affected_allergens,
                affected_barcodes  = EXCLUDED.affected_barcodes,
                recall_url         = EXCLUDED.recall_url,
@@ -674,6 +677,7 @@ export async function upsertRecalls(recalls: RecallEntry[]): Promise<void> {
           r.brand,
           r.recallDate,
           r.reason,
+          r.states ?? [],
           r.affectedAllergens,
           r.affectedBarcodes,
           r.recallUrl,
@@ -692,7 +696,7 @@ export async function loadRecalls(): Promise<RecallRow[]> {
   if (!pool) return [];
   try {
     const result = await pool.query(
-      `SELECT * FROM recall_entries WHERE is_active = TRUE ORDER BY last_seen DESC LIMIT 100`
+      `SELECT * FROM recall_entries WHERE is_active = TRUE ORDER BY last_seen DESC LIMIT 300`
     );
     return result.rows;
   } catch (err) {
