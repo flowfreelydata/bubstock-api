@@ -1377,10 +1377,12 @@ export async function registerReferralCode(code: string, deviceId: string): Prom
 
 export async function redeemReferralCode(
   code: string,
-  deviceId: string
+  deviceId: string,
+  hwKeyId?: string
 ): Promise<{ accepted: boolean; status: number; message: string }> {
   const cleanCode = code.toUpperCase().replace(/[^A-Z0-9]/g, "");
   const devHash = hashDeviceId(deviceId);
+  const hwHash = hwKeyId ? hashDeviceId(`hw:${hwKeyId}`) : undefined;
   if (cleanCode.length !== 6 || !devHash) {
     return { accepted: false, status: 400, message: "Enter a valid 6-character invite code." };
   }
@@ -1389,9 +1391,12 @@ export async function redeemReferralCode(
     const ref = memoryReferrals.get(cleanCode);
     if (!ref) return { accepted: false, status: 404, message: "That invite code wasn't found. Ask your friend to open Bubstock once to activate their code." };
     if (ref.ownerHash === devHash) return { accepted: false, status: 400, message: "That's your own code. Share it with a friend instead." };
-    if (memoryDeviceClaims.has(devHash)) return { accepted: false, status: 409, message: "This device has already redeemed a free preview invite." };
+    if (memoryDeviceClaims.has(devHash) || (hwHash && memoryDeviceClaims.has(hwHash))) {
+      return { accepted: false, status: 409, message: "This device has already redeemed a free preview invite." };
+    }
     ref.redeemers.add(devHash);
     memoryDeviceClaims.add(devHash);
+    if (hwHash) memoryDeviceClaims.add(hwHash);
     return { accepted: true, status: 200, message: "2 months of Bubstock+ Preview unlocked!" };
   }
 
@@ -1405,6 +1410,20 @@ export async function redeemReferralCode(
   const ownerHash = String(refRes.rows[0].owner_device_hash);
   if (ownerHash === devHash) {
     return { accepted: false, status: 400, message: "That's your own invite code — share it with a friend instead." };
+  }
+
+  // If attested with a hardware key, prevent rotating fake deviceId UUIDs from farming rewards
+  if (hwHash) {
+    const hwClaim = await pool.query(
+      `INSERT INTO device_promo_claims (device_hash, kind)
+       VALUES ($1, 'referral_hw')
+       ON CONFLICT (device_hash) DO NOTHING
+       RETURNING device_hash`,
+      [hwHash]
+    );
+    if ((hwClaim.rowCount ?? 0) === 0) {
+      return { accepted: false, status: 409, message: "This device has already claimed a free preview reward." };
+    }
   }
 
   const claimRes = await pool.query(
@@ -1664,37 +1683,54 @@ export async function joinMothersGroup(
   };
 }
 
-export async function getMothersGroup(groupCode: string): Promise<MothersGroupStatus | null> {
+export async function getMothersGroup(
+  groupCode: string,
+  memberDeviceId?: string
+): Promise<{ status: MothersGroupStatus | null; forbidden?: boolean }> {
   const cleanCode = groupCode.toUpperCase().replace(/[^A-Z0-9]/g, "");
+  const memberHash = memberDeviceId ? hashDeviceId(memberDeviceId) : undefined;
+  if (!memberHash) {
+    return { status: null, forbidden: true };
+  }
+
   if (!pool) {
     const g = memoryGroups.get(cleanCode);
-    if (!g) return null;
+    if (!g) return { status: null };
+    if (!g.members.has(memberHash)) return { status: null, forbidden: true };
     const count = g.members.size;
     return {
-      groupCode: cleanCode,
-      suburb: g.suburb,
-      city: g.city,
-      memberCount: count,
-      targetCount: 3,
-      unlocked: count >= 3,
-      createdAt: g.createdAt,
+      status: {
+        groupCode: cleanCode,
+        suburb: g.suburb,
+        city: g.city,
+        memberCount: count,
+        targetCount: 3,
+        unlocked: count >= 3,
+        createdAt: g.createdAt,
+      },
     };
   }
   const r = await pool.query(
     `SELECT group_code, suburb, city, member_hashes, created_at FROM mothers_groups WHERE group_code = $1`,
     [cleanCode]
   );
-  if (r.rows.length === 0) return null;
+  if (r.rows.length === 0) return { status: null };
   const row = r.rows[0];
-  const count = Array.isArray(row.member_hashes) ? row.member_hashes.length : 0;
+  const members: string[] = Array.isArray(row.member_hashes) ? row.member_hashes : [];
+  if (!members.includes(memberHash)) {
+    return { status: null, forbidden: true };
+  }
+  const count = members.length;
   return {
-    groupCode: row.group_code,
-    suburb: row.suburb,
-    city: row.city,
-    memberCount: count,
-    targetCount: 3,
-    unlocked: count >= 3,
-    createdAt: new Date(row.created_at).toISOString(),
+    status: {
+      groupCode: row.group_code,
+      suburb: row.suburb,
+      city: row.city,
+      memberCount: count,
+      targetCount: 3,
+      unlocked: count >= 3,
+      createdAt: new Date(row.created_at).toISOString(),
+    },
   };
 }
 

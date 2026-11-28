@@ -396,7 +396,7 @@ app.use(generalLimit);
 app.get("/", (_req, res) => {
   res.json({
     service: "bubstock-au-api",
-    version: "3.4.0",
+    version: "3.4.1",
     apnsReady: isApnsConfigured(),
     cities: Object.values(CITY_CONTEXTS).map((c) => c.regionLabel),
     policy: "100% live & verified data — zero synthetic fallbacks",
@@ -499,7 +499,7 @@ app.get("/admin/security/summary", async (req: Request, res: Response) => {
   res.setHeader("Cache-Control", "no-store, private");
   res.json({
     service: "bubstock-au-api",
-    version: "3.4.0",
+    version: "3.4.1",
     ...summary,
     generatedAt: new Date().toISOString(),
   });
@@ -1329,18 +1329,36 @@ async function getRecallsList(): Promise<{ recalls: RecallEntry[]; source: strin
   });
 }
 
-app.get("/recalls", async (req: Request, res: Response) => {
-  const rawState = String(req.query.state ?? "").trim().toUpperCase();
+// Precompiled static regex allowlist per AU state — eliminates any user-controlled RegExp construction (ReDoS/injection)
+const RECALL_STATE_FILTER_RE: Record<string, RegExp> = {
+  VIC: /\b(VIC|Victoria|National|Australia)\b/i,
+  NSW: /\b(NSW|New South Wales|National|Australia)\b/i,
+  QLD: /\b(QLD|Queensland|National|Australia)\b/i,
+  WA: /\b(WA|Western Australia|National|Australia)\b/i,
+  SA: /\b(SA|South Australia|National|Australia)\b/i,
+  TAS: /\b(TAS|Tasmania|National|Australia)\b/i,
+  ACT: /\b(ACT|Australian Capital Territory|National|Australia)\b/i,
+  NT: /\b(NT|Northern Territory|National|Australia)\b/i,
+};
+
+app.get("/recalls", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
+  const rawState = sanitizeText(req.query.state, 10).toUpperCase();
   const ctx = resolveCityAndState(req);
   const { recalls, source } = await getRecallsList();
 
-  let sorted = [...recalls];
-  if (rawState !== "ALL") {
-    const targetState = rawState || ctx.state;
-    const stateRe = new RegExp(`\\b(${targetState}|National|Australia)\\b`, "i");
+  const sorted = [...recalls];
+  const validTargetState =
+    rawState === "ALL"
+      ? "ALL"
+      : Object.prototype.hasOwnProperty.call(RECALL_STATE_FILTER_RE, rawState)
+        ? rawState
+        : ctx.state;
+
+  if (validTargetState !== "ALL") {
+    const stateRe = RECALL_STATE_FILTER_RE[validTargetState] ?? RECALL_STATE_FILTER_RE.VIC;
     sorted.sort((a, b) => {
-      const aHit = (a.states?.includes(targetState) || a.states?.includes("National") || stateRe.test(a.reason)) ? 1 : 0;
-      const bHit = (b.states?.includes(targetState) || b.states?.includes("National") || stateRe.test(b.reason)) ? 1 : 0;
+      const aHit = (a.states?.includes(validTargetState) || a.states?.includes("National") || stateRe.test(a.reason)) ? 1 : 0;
+      const bHit = (b.states?.includes(validTargetState) || b.states?.includes("National") || stateRe.test(b.reason)) ? 1 : 0;
       if (aHit !== bHit) return bHit - aHit;
       return (Date.parse(b.recallDate) || 0) - (Date.parse(a.recallDate) || 0);
     });
@@ -1350,21 +1368,21 @@ app.get("/recalls", async (req: Request, res: Response) => {
   res.json({
     recalls: sorted,
     count: sorted.length,
-    state: rawState === "ALL" ? "ALL" : ctx.state,
+    state: validTargetState,
     source,
     fetchedAt: new Date().toISOString(),
   });
 });
 
-app.get("/recalls/check", async (req: Request, res: Response) => {
-  const { productName, barcode } = req.query;
+app.get("/recalls/check", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   const { recalls } = await getRecallsList();
 
-  const term = String(productName ?? "").toLowerCase().trim();
+  const term = sanitizeText(req.query.productName, 120).toLowerCase();
   const tokens = term
     .split(/\s+/)
-    .filter((w) => w.length >= 4 && !["baby", "food", "stage", "infant", "formula", "pouch"].includes(w));
-  const bc = String(barcode ?? "").trim();
+    .filter((w) => w.length >= 4 && !["baby", "food", "stage", "infant", "formula", "pouch"].includes(w))
+    .slice(0, 8);
+  const bc = sanitizeText(req.query.barcode, 40);
 
   const matches = recalls.filter((r) => {
     if (bc && r.affectedBarcodes.includes(bc)) return true;
@@ -1392,7 +1410,7 @@ app.get("/recalls/check", async (req: Request, res: Response) => {
 
 const VALID_STATES = new Set<StockStateValue>(["onShelf", "runningLow", "likelyGone"]);
 
-app.get("/sightings", async (req: Request, res: Response) => {
+app.get("/sightings", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   const ctx = resolveCityAndState(req);
   const productId = typeof req.query.productId === "string" ? req.query.productId.trim() : undefined;
   const storeId = typeof req.query.storeId === "string" ? req.query.storeId.trim() : undefined;
@@ -1674,7 +1692,7 @@ app.post("/promo/submit", strictBotGuard, sightingLimit, async (req: Request, re
   });
 });
 
-app.get("/promo/recent", async (req: Request, res: Response) => {
+app.get("/promo/recent", antiLeechGuard, dataDumpLimit, async (req: Request, res: Response) => {
   // Protected admin-only endpoint — prevents public scraping of submitted social URLs & referral codes.
   const adminKey = process.env.ADMIN_API_KEY ?? process.env.INGEST_API_KEY;
   if (!adminKey || !timingSafeKeyMatch(req.headers["x-admin-key"] ?? req.headers["x-ingest-key"], adminKey)) {
@@ -1788,6 +1806,10 @@ function matchDropsForSubscription(
 const VALID_DEVICE_ID_RE = /^[a-zA-Z0-9-]{16,80}$/;
 
 app.post("/alerts/sync", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
+  if (req.security?.useMirage) {
+    res.status(403).json({ error: "Forbidden — untrusted client signature" });
+    return;
+  }
   const {
     deviceId,
     apnsToken,
@@ -1864,6 +1886,10 @@ app.post("/alerts/sync", strictBotGuard, sightingLimit, async (req: Request, res
 });
 
 app.get("/alerts/check", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
+  if (req.security?.useMirage) {
+    res.status(403).json({ error: "Forbidden — untrusted client signature" });
+    return;
+  }
   const deviceId = sanitizeText(req.query.deviceId, 80);
   if (!VALID_DEVICE_ID_RE.test(deviceId)) {
     res.status(400).json({ error: "Valid deviceId required" });
@@ -1876,10 +1902,11 @@ app.get("/alerts/check", strictBotGuard, sightingLimit, async (req: Request, res
     return;
   }
 
-  // Prevent IDOR: if bound to a hardware key, reject mismatched/unattested callers
+  // Prevent IDOR (including pre-enrollment): require valid hardware attestation matching ownerKeyId
+  // so an unattested caller can never consume/suppress another user's pending alerts.
   const callerKeyId = req.security?.isAttested ? req.security.keyId : undefined;
-  if (sub.ownerKeyId && callerKeyId !== sub.ownerKeyId) {
-    res.status(403).json({ error: "Forbidden — hardware key mismatch" });
+  if (!callerKeyId || (sub.ownerKeyId && callerKeyId !== sub.ownerKeyId)) {
+    res.status(403).json({ error: "Forbidden — hardware attestation required" });
     return;
   }
 
@@ -2041,13 +2068,18 @@ app.get("/referrals/status", strictBotGuard, sightingLimit, async (req: Request,
 });
 
 app.post("/referrals/redeem", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
+  if (req.security?.useMirage) {
+    res.status(403).json({ accepted: false, monthsGranted: 0, message: "Request rejected." });
+    return;
+  }
   const code = sanitizeText(req.body?.code, 12);
   const deviceId = sanitizeText(req.body?.deviceId, 80);
   if (!VALID_DEVICE_ID_RE.test(deviceId)) {
     res.status(400).json({ accepted: false, monthsGranted: 0, message: "Valid deviceId required." });
     return;
   }
-  const result = await redeemReferralCode(code, deviceId);
+  const hwKeyId = req.security?.isAttested ? req.security.keyId : undefined;
+  const result = await redeemReferralCode(code, deviceId, hwKeyId);
   res.status(result.status).json({
     accepted: result.accepted,
     monthsGranted: result.accepted ? 2 : 0,
@@ -2058,6 +2090,10 @@ app.post("/referrals/redeem", strictBotGuard, sightingLimit, async (req: Request
 // ─── Mothers' Group / Playgroup Syndicate (Sybil-Resistant 3-Family Loop) ────
 
 app.post("/groups/create", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
+  if (req.security?.useMirage) {
+    res.status(403).json({ error: "Forbidden — untrusted client" });
+    return;
+  }
   const suburb = sanitizeText(req.body?.suburb, 60) || "Melbourne";
   const city = sanitizeText(req.body?.city, 40) || "Melbourne";
   const deviceId = sanitizeText(req.body?.deviceId, 80);
@@ -2070,6 +2106,10 @@ app.post("/groups/create", strictBotGuard, sightingLimit, async (req: Request, r
 });
 
 app.post("/groups/join", strictBotGuard, sightingLimit, async (req: Request, res: Response) => {
+  if (req.security?.useMirage) {
+    res.status(403).json({ error: "Forbidden — untrusted client" });
+    return;
+  }
   const groupCode = sanitizeText(req.body?.groupCode, 16);
   const deviceId = sanitizeText(req.body?.deviceId, 80);
   if (groupCode.length < 4 || !VALID_DEVICE_ID_RE.test(deviceId)) {
@@ -2089,12 +2129,27 @@ app.post("/groups/join", strictBotGuard, sightingLimit, async (req: Request, res
 });
 
 app.get("/groups/:code", strictBotGuard, vaultReadLimit, async (req: Request, res: Response) => {
-  const status = await getMothersGroup(String(req.params.code ?? ""));
-  if (!status) {
+  if (req.security?.useMirage) {
+    res.status(403).json({ error: "Forbidden" });
+    return;
+  }
+  const code = sanitizeText(req.params.code, 12);
+  const deviceId = sanitizeText(req.query.deviceId, 80);
+  if (!/^[A-Z0-9]{4,10}$/i.test(code) || !VALID_DEVICE_ID_RE.test(deviceId)) {
+    res.status(400).json({ error: "Valid group code and member deviceId required" });
+    return;
+  }
+  const result = await getMothersGroup(code, deviceId);
+  res.setHeader("Cache-Control", "no-store, private");
+  if (result.forbidden) {
+    res.status(403).json({ error: "Forbidden — only group members can view this Mothers' Group" });
+    return;
+  }
+  if (!result.status) {
     res.status(404).json({ error: "Group not found" });
     return;
   }
-  res.json(status);
+  res.json(result.status);
 });
 
 // ─── Real-Time Suburb Shortage Heatmap & 90-Day Shrinkflation Detector ───────
@@ -2282,7 +2337,7 @@ cron.schedule("0 3 * * *", async () => {
 // ─── Startup & Graceful shutdown ─────────────────────────────────────────────
 
 const server = app.listen(PORT, async () => {
-  log("info", "bubstock-au-api listening", { port: PORT, version: "3.4.0", apnsReady: isApnsConfigured() });
+  log("info", "bubstock-au-api listening", { port: PORT, version: "3.4.1", apnsReady: isApnsConfigured() });
 
   await initSchema().catch((e) =>
     log("error", "schema init failed", { err: (e as Error).message })

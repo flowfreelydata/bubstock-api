@@ -42,6 +42,9 @@ oyFraWVIyd/dganmrduC1bmTBGwD
 const APPLE_APP_ATTEST_ROOT_CA = new crypto.X509Certificate(APPLE_APP_ATTEST_ROOT_CA_PEM);
 // ASN.1 DER encoding of Apple App Attest Nonce Extension OID 1.2.840.113635.100.8.2
 const APPLE_ATTEST_NONCE_OID_DER = Buffer.from("06092a864886f763640802", "hex");
+// Official Apple App Attest 16-byte AAGUIDs (developer.apple.com/documentation/devicecheck/validating-apps-that-connect-to-your-server)
+const APP_ATTEST_PROD_AAGUID = Buffer.concat([Buffer.from("appattest", "ascii"), Buffer.alloc(7, 0)]);
+const APP_ATTEST_DEV_AAGUID = Buffer.from("appattestdevelop", "ascii");
 
 const MAX_CHALLENGES = 5_000;
 const CHALLENGE_TTL_MS = 120_000;
@@ -191,7 +194,8 @@ export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string, ke
       authData?: unknown;
     };
     if (!decoded || decoded.fmt !== "apple-appattest") return false;
-    if (!Buffer.isBuffer(decoded.authData) || decoded.authData.length < 37) return false;
+    // authData must contain rpIdHash(32) + flags(1) + signCount(4) + aaguid(16) + credIdLen(2) + credId(>=32)
+    if (!Buffer.isBuffer(decoded.authData) || decoded.authData.length < 87) return false;
     const x5c = decoded.attStmt?.x5c;
     if (!Array.isArray(x5c) || x5c.length < 2) return false;
 
@@ -235,9 +239,38 @@ export function verifyAppleAppAttestCbor(cborB64: unknown, challenge: string, ke
     const extWindow = credRaw.subarray(oidPos, Math.min(credRaw.length, oidPos + 96));
     if (extWindow.indexOf(expectedBoundNonce) === -1) return false;
 
-    // Optional strict App ID hash check once APPLE_TEAM_ID is configured in Railway
+    // Apple App Attest Step 5: initial attestation signCount MUST be 0
+    const signCount = decoded.authData.readUInt32BE(33);
+    if (signCount !== 0) return false;
+
+    // Apple App Attest Step 6: verify AAGUID is genuine Apple App Attest (reject dev builds in production)
+    const aaguid = decoded.authData.subarray(37, 53);
+    const isProdAaguid = crypto.timingSafeEqual(aaguid, APP_ATTEST_PROD_AAGUID);
+    const isDevAaguid = crypto.timingSafeEqual(aaguid, APP_ATTEST_DEV_AAGUID);
+    const allowDevAttest = process.env.NODE_ENV !== "production" || process.env.ALLOW_DEV_APP_ATTEST === "1";
+    if (!isProdAaguid && !(isDevAaguid && allowDevAttest)) return false;
+
+    // Apple App Attest Step 7: verify credentialId equals SHA256 of leaf cert's uncompressed EC P-256 public key
+    const credIdLen = decoded.authData.readUInt16BE(53);
+    if (credIdLen !== 32 || decoded.authData.length < 55 + credIdLen) return false;
+    const credId = decoded.authData.subarray(55, 55 + credIdLen);
+    const leafSpki = certs[0].publicKey.export({ format: "der", type: "spki" });
+    if (!Buffer.isBuffer(leafSpki) || leafSpki.length < 65) return false;
+    const leafRawPoint = leafSpki.subarray(leafSpki.length - 65);
+    if (leafRawPoint[0] !== 0x04) return false;
+    const expectedCredId = crypto.createHash("sha256").update(leafRawPoint).digest();
+    if (!crypto.timingSafeEqual(credId, expectedCredId)) return false;
+
+    // Apple App Attest Step 4 (Fail-Closed in Production):
+    // Require APPLE_TEAM_ID so no foreign Apple Developer account's app can claim app_attest trust.
     const teamId = process.env.APPLE_TEAM_ID?.trim();
-    if (teamId) {
+    const isProd = process.env.NODE_ENV === "production";
+    if (!teamId) {
+      if (isProd && process.env.ALLOW_UNPINNED_TEAM_ID !== "1") {
+        return false;
+      }
+    } else {
+      if (!/^[A-Z0-9]{10}$/.test(teamId)) return false;
       const expectedRpHash = crypto
         .createHash("sha256")
         .update(`${teamId}.au.com.bubstock.app`, "utf8")
@@ -654,8 +687,14 @@ export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResul
     if (typeof payload.revocationDate === "number" && payload.revocationDate > 0) {
       return { valid: false, reason: "revoked_transaction" };
     }
-    if (typeof payload.expiresDate === "number" && payload.expiresDate < Date.now() - 60_000) {
-      return { valid: false, reason: "expired_subscription" };
+    if (typeof payload.expiresDate !== "number" || payload.expiresDate < Date.now() - 60_000) {
+      return { valid: false, reason: "expired_or_missing_expiry" };
+    }
+    // Fail-closed in production: reject Sandbox/Xcode test receipts unless explicitly allowed
+    const allowSandbox =
+      process.env.NODE_ENV !== "production" || process.env.ALLOW_SANDBOX_RECEIPTS === "1";
+    if (payload.environment !== "Production" && !allowSandbox) {
+      return { valid: false, reason: "sandbox_receipt_rejected_in_production" };
     }
 
     // Parse & verify EVERY certificate's date window inside x5c
@@ -670,6 +709,10 @@ export function verifyStoreKitJwsCrypto(jws: unknown): StoreKitVerificationResul
         return { valid: false, reason: "cert_not_valid_now" };
       }
       certs.push(cert);
+    }
+
+    if (certs[0].ca) {
+      return { valid: false, reason: "leaf_cert_cannot_be_ca" };
     }
 
     // Verify EVERY cryptographic link in the x5c chain
